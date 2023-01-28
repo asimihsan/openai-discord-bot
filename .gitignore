@@ -2,3 +2,4 @@ env.sh
 *.code-workspace
 build/*
 !build/.gitkeep
+.idea

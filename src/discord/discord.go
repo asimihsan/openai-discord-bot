@@ -66,8 +66,7 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 	d.discordClient.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
-				err := d.deferInteractionReply(s, i)
-				if err != nil {
+				if err := d.deferInteractionReply(s, i); err != nil {
 					return
 				}
 				handler(s, i)
