@@ -8,11 +8,7 @@ import (
 	"src/openai"
 )
 
-const (
-	tokenEnvName = "DISCORD_TOKEN"
-)
-
-type DiscordConfig struct {
+type Config struct {
 	RemoveCommands bool
 }
 
@@ -20,11 +16,11 @@ type Discord struct {
 	discordClient      *discordgo.Session
 	openaiClient       *openai.OpenAI
 	registeredCommands []*discordgo.ApplicationCommand
-	config             DiscordConfig
+	config             Config
 	zlog               *zerolog.Logger
 }
 
-type DiscordCommand struct {
+type Command struct {
 	Name        string
 	Description string
 	Type        discordgo.ApplicationCommandType
@@ -32,8 +28,8 @@ type DiscordCommand struct {
 	Options     []*discordgo.ApplicationCommandOption
 }
 
-func (d *Discord) getDiscordCommands() []DiscordCommand {
-	return []DiscordCommand{
+func (d *Discord) getDiscordCommands() []Command {
+	return []Command{
 		{
 			Name:        "ping",
 			Description: "Ping the bot",
@@ -70,6 +66,10 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 	d.discordClient.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
+				err := d.deferInteractionReply(s, i)
+				if err != nil {
+					return
+				}
 				handler(s, i)
 			}
 		}
@@ -117,7 +117,7 @@ func NewDiscord(discordToken string, openaiClient *openai.OpenAI, zlog *zerolog.
 	discord := Discord{
 		discordClient: discordClient,
 		openaiClient:  openaiClient,
-		config: DiscordConfig{
+		config: Config{
 			RemoveCommands: false,
 		},
 		zlog: zlog,
@@ -145,27 +145,31 @@ func NewDiscord(discordToken string, openaiClient *openai.OpenAI, zlog *zerolog.
 	return &discord, nil
 }
 
-func (d *Discord) pingInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	payload := i.ApplicationCommandData()
-	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received ping command")
-	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: "Pong!",
-		},
-	})
-}
-
-func (d *Discord) completeInterationHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Send an initial response to acknowledge the command.
+func (d *Discord) deferInteractionReply(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
 	if err != nil {
-		d.zlog.Error().Err(err).Msg("Failed to send initial response to interaction")
-		return
+		d.zlog.Error().Err(err).Msg("Failed to defer interaction reply")
+		return err
 	}
+	return nil
+}
 
+func (d *Discord) pingInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	payload := i.ApplicationCommandData()
+	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received ping command")
+
+	// Send the pong message by editing the original interaction response.
+	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: Ptr("Pong!"),
+	})
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("Failed to edit interaction response")
+	}
+}
+
+func (d *Discord) completeInterationHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	// Get the payload from the interaction.
 	payload := i.ApplicationCommandData()
 	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received command")
@@ -182,11 +186,8 @@ func (d *Discord) completeInterationHandler(s *discordgo.Session, i *discordgo.I
 	}
 
 	// Respond to the interaction.
-	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: completion,
-		},
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: Ptr(completion),
 	})
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("Failed to respond to interaction")
@@ -214,4 +215,8 @@ func (d *Discord) Close(zlog *zerolog.Logger) error {
 		resultError = multierror.Append(resultError, err)
 	}
 	return resultError
+}
+
+func Ptr[T any](t T) *T {
+	return &t
 }
