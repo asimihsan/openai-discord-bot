@@ -7,6 +7,8 @@ A Discord bot that uses OpenAI's GPT-3 API to generate text, generate images and
 - [x] Add a command to generate text from a prompt
 - [x] When generating text, print out the original prompt as well as the generated text.
 - [x] Add a command to generate an image from a prompt
-- [ ] Build and run via Docker
-- [ ] Add a command to have a conversation with the bot
+- [x] Build and run via Docker
+- [ ] DynamoDB lock. All instances get messages, but get a lock so that only one processes it and responds. If instance fails while holding the lock, another instance will get the lock and respond.
 - [ ] Infrastructure to deploy the bot to AWS
+- [ ] Text completion shouldn't use interactions, so that inputs can be free-form.
+- [ ] Add a command to have a conversation with the bot. Will have it in a new thread.

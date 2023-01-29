@@ -12,6 +12,9 @@ terraform {
     }
 }
 
+data "aws_region" "current" {
+}
+
 provider "aws" {
   region = "us-west-2"
 }
@@ -115,38 +118,6 @@ resource "aws_cloudfront_distribution" "my_bucket_distribution" {
     })
 }
 
-resource "aws_iam_role" "bot_role" {
-    name = "bot_role_${random_id.application.hex}"
-
-    assume_role_policy = jsonencode({
-        Version = "2012-10-17"
-        Statement = [
-            {
-                Action = "sts:AssumeRole"
-                Effect = "Allow"
-                Principal = {
-                    "AWS": ""
-                }
-            }
-        ]
-    })
-
-    inline_policy {
-        name = "putobject_to_bucket"
-
-        policy = jsonencode({
-            Version = "2012-10-17"
-            Statement = [
-                {
-                    Action = "s3:PutObject"
-                    Effect = "Allow"
-                    Resource = "arn:aws:s3:::${aws_s3_bucket.my_bucket.bucket}/*"
-                }
-            ]
-        })
-    }
-}
-
 resource "aws_s3_bucket_policy" "my_bucket" {
     bucket = aws_s3_bucket.my_bucket.id
     
@@ -173,6 +144,85 @@ resource "aws_s3_bucket_policy" "my_bucket" {
     })
 }
 
+// DynamoDB lock table
+resource "aws_dynamodb_table" "bot_lock_table" {
+    name = "bot_lock_table_${random_id.application.hex}"
+    billing_mode = "PAY_PER_REQUEST"
+    
+    server_side_encryption {
+        enabled = true
+    }
+
+    hash_key = "LockID"
+
+    attribute {
+        name = "LockID"
+        type = "S"
+    }
+
+    attribute {
+        name = "LastUpdated"
+        type = "N"
+    }
+
+    attribute {
+        name = "PendingShard"
+        type = "N"
+    }
+
+    global_secondary_index {
+        name = "PendingShardIndex"
+        hash_key = "PendingShard"
+        range_key = "LastUpdated"
+        projection_type = "ALL"
+    }
+
+    ttl {
+        attribute_name = "TTL"
+        enabled = true
+    }
+
+    tags = merge(local.tags, {
+        Name = "bot_lock_table"
+    })
+}
+
+resource "aws_iam_role" "bot_role" {
+    name = "bot_role_${random_id.application.hex}"
+
+    assume_role_policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [
+            {
+                Action = "sts:AssumeRole"
+                Effect = "Allow"
+                Principal = {
+                    Service = "ec2.amazonaws.com"
+                }
+            }
+        ]
+    })
+
+    inline_policy {
+        name = "putobject_to_bucket"
+
+        policy = jsonencode({
+            Version = "2012-10-17"
+            Statement = [
+                {
+                    Action = "s3:PutObject"
+                    Effect = "Allow"
+                    Resource = "arn:aws:s3:::${aws_s3_bucket.my_bucket.bucket}/*"
+                }
+            ]
+        })
+    }
+}
+
+output "aws_region" {
+    value = data.aws_region.current.name
+}
+
 output "my_bucket" {
     value = aws_s3_bucket.my_bucket.bucket
 }
@@ -191,4 +241,8 @@ output "my_bucket_distribution_arn" {
 
 output "bot_role" {
     value = aws_iam_role.bot_role.arn
+}
+
+output "bot_lock_table" {
+    value = aws_dynamodb_table.bot_lock_table.name
 }
