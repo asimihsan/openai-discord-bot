@@ -1,11 +1,14 @@
 package discord
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
 	"src/openai"
+	"strings"
 )
 
 type Config struct {
@@ -41,12 +44,27 @@ func (d *Discord) getDiscordCommands() []Command {
 			Name:        "complete",
 			Description: "Complete a prompt",
 			Type:        discordgo.ChatApplicationCommand,
-			Handler:     d.completeInterationHandler,
+			Handler:     d.completeInteractionHandler,
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:         discordgo.ApplicationCommandOptionString,
 					Name:         "prompt",
 					Description:  "The prompt to complete",
+					Required:     true,
+					Autocomplete: true,
+				},
+			},
+		},
+		{
+			Name:        "image",
+			Description: "Create an image from a prompt",
+			Type:        discordgo.ChatApplicationCommand,
+			Handler:     d.createImageInteractionHandler,
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:         discordgo.ApplicationCommandOptionString,
+					Name:         "prompt",
+					Description:  "The prompt to use to create the image",
 					Required:     true,
 					Autocomplete: true,
 				},
@@ -106,7 +124,7 @@ func (d *Discord) DebugApplicationCommands() {
 	}
 }
 
-func NewDiscord(discordToken string, openaiClient *openai.OpenAI, zlog *zerolog.Logger) (*Discord, error) {
+func NewDiscord(discordToken string, openaiClient *openai.OpenAI, guildID string, zlog *zerolog.Logger) (*Discord, error) {
 	discordClient, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
 		zlog.Error().Err(err).Msg("failed to create Discord client")
@@ -128,7 +146,6 @@ func NewDiscord(discordToken string, openaiClient *openai.OpenAI, zlog *zerolog.
 		return nil, err
 	}
 
-	guildID := ""
 	err = discord.setupDiscordCommands(guildID, zlog)
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to setup Discord commands")
@@ -168,13 +185,13 @@ func (d *Discord) pingInteractionHandler(s *discordgo.Session, i *discordgo.Inte
 	}
 }
 
-func (d *Discord) completeInterationHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+func (d *Discord) completeInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	// Get the payload from the interaction.
 	payload := i.ApplicationCommandData()
 	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received command")
 
 	// Get the prompt from the payload.
-	prompt := payload.Options[0].StringValue()
+	prompt := strings.TrimSpace(payload.Options[0].StringValue())
 
 	// Get the completion from OpenAI.
 	ctx := context.Background()
@@ -183,10 +200,51 @@ func (d *Discord) completeInterationHandler(s *discordgo.Session, i *discordgo.I
 		d.zlog.Error().Err(err).Msg("Failed to get completion from OpenAI")
 		return
 	}
+	completion = strings.TrimSpace(completion)
+
+	// Create a response string, which is the original prompt in a quote block, followed by the completion.
+	response := fmt.Sprintf("> %s\n\n%s", prompt, completion)
 
 	// Respond to the interaction.
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content: Ptr(completion),
+		Content: Ptr(response),
+	})
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("Failed to respond to interaction")
+		return
+	}
+}
+
+func (d *Discord) createImageInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Get the payload from the interaction.
+	payload := i.ApplicationCommandData()
+	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received command")
+
+	// Get the prompt from the payload.
+	prompt := strings.TrimSpace(payload.Options[0].StringValue())
+
+	// Get the image URLs from OpenAI.
+	ctx := context.Background()
+	resp, err := d.openaiClient.CreateImage(prompt, ctx, d.zlog)
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("Failed to get completion from OpenAI")
+		return
+	}
+
+	response := fmt.Sprintf("> %s", prompt)
+	files := make([]*discordgo.File, 0)
+	for i := 0; i < len(resp.Images); i++ {
+		name := fmt.Sprintf("image%d.png", i)
+		files = append(files, &discordgo.File{
+			Name:   name,
+			Reader: bytes.NewReader(resp.Images[i].Data),
+		})
+	}
+
+	// Respond to the interaction.
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: Ptr(response),
+		Files:   files,
 	})
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("Failed to respond to interaction")

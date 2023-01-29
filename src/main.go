@@ -14,6 +14,7 @@ import (
 const (
 	discordTokenEnvName = "DISCORD_TOKEN"
 	openaiTokenEnvName  = "OPENAI_TOKEN"
+	guildIDTokenEnvName = "DISCORD_GUILD_ID"
 )
 
 func main() {
@@ -36,7 +37,12 @@ func main() {
 	if !ok {
 		zlog.Fatal().Msgf("Missing %s environment variable", discordTokenEnvName)
 	}
-	discordBot, err := discord.NewDiscord(discordToken, openaiClient, &zlog)
+	guildID, ok := os.LookupEnv(guildIDTokenEnvName)
+	if !ok {
+		zlog.Fatal().Msgf("Missing %s environment variable", guildIDTokenEnvName)
+	}
+
+	discordBot, err := discord.NewDiscord(discordToken, openaiClient, guildID, &zlog)
 	if err != nil {
 		fmt.Println(err)
 		return
