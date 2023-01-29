@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dynamodb_types "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/gofrs/uuid"
 	"github.com/rs/zerolog"
 	"strconv"
 	"time"
@@ -17,7 +18,7 @@ var (
 )
 
 type DynamoDBLockConfig struct {
-	OwnerName            string
+	Owner                string
 	MaxShards            int
 	LeaseDurationSeconds int
 }
@@ -157,4 +158,62 @@ func (d *DynamoDBLockClient[T]) putNewLock(
 ) error {
 	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
 	leaseDurationMilliseconds := int64(d.Config.LeaseDurationSeconds) * int64(time.Second) / int64(time.Millisecond)
+	serializedData, err := Serialize(data)
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to serialize data")
+		return err
+	}
+	recordVersionNumber, err := uuid.NewV6()
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to generate record version number")
+		return err
+	}
+
+	// Put the lock into the table, but use a condition expression to ensure that the lock is not already in the table.
+	lock := NewLock[T](
+		id,
+		d.Config.Owner,
+		leaseDurationMilliseconds,
+		nowMilliseconds,
+		recordVersionNumber.String(),
+		data,
+	)
+	item, err := lockToDynamoDBAttributeValues(lock)
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to convert lock to DynamoDB attribute values")
+		return err
+	}
+
+	_, err = d.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           &d.TableName,
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(LockID)"),
+	})
+}
+
+func lockToDynamoDBAttributeValues[T any](lock Lock[T]) (map[string]dynamodb_types.AttributeValue, error) {
+	serializedData, err := Serialize(lock.Data)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]dynamodb_types.AttributeValue{
+		"LockID": &dynamodb_types.AttributeValueMemberS{
+			Value: lock.ID,
+		},
+		"Owner": &dynamodb_types.AttributeValueMemberS{
+			Value: lock.Owner,
+		},
+		"LeaseDurationMilliseconds": &dynamodb_types.AttributeValueMemberN{
+			Value: strconv.Itoa(int(lock.LeaseDurationMilliseconds)),
+		},
+		"LastUpdatedTimeMilliseconds": &dynamodb_types.AttributeValueMemberN{
+			Value: strconv.Itoa(int(lock.LastUpdatedTimeMilliseconds)),
+		},
+		"RecordVersionNumber": &dynamodb_types.AttributeValueMemberS{
+			Value: lock.RecordVersionNumber,
+		},
+		"Data": &dynamodb_types.AttributeValueMemberS{
+			Value: serializedData,
+		},
+	}, nil
 }

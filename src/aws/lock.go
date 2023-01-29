@@ -8,7 +8,7 @@ import (
 )
 
 type Lock[T any] struct {
-	Id                          string
+	ID                          string
 	Owner                       string
 	LeaseDurationMilliseconds   int64
 	LastUpdatedTimeMilliseconds int64
@@ -27,7 +27,7 @@ type LockClient[T any] interface {
 }
 
 func NewLock[T any](
-	Id string,
+	ID string,
 	Owner string,
 	LeaseDurationMilliseconds int64,
 	LastUpdatedTimeMilliseconds int64,
@@ -35,7 +35,7 @@ func NewLock[T any](
 	Data T,
 ) Lock[T] {
 	return Lock[T]{
-		Id:                          Id,
+		ID:                          ID,
 		Owner:                       Owner,
 		LeaseDurationMilliseconds:   LeaseDurationMilliseconds,
 		LastUpdatedTimeMilliseconds: LastUpdatedTimeMilliseconds,
