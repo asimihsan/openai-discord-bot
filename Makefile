@@ -8,13 +8,21 @@ AWS_COMMAND := aws-vault exec $(AWS_PROFILE) --region us-west-2 --
 .PHONY: clean
 
 build-bot: $(GO_SRCS)
-	cd src && go build -o ../build/$(APP_NAME) main.go
+	cd src && docker buildx build --platform linux/arm64 -t $(APP_NAME) .
 
 clean:
 	rm -rf build/*
 
-run: build-bot
-	source env.sh && $(AWS_COMMAND) build/$(APP_NAME)
+run:
+	source env.sh && $(AWS_COMMAND) docker run \
+		--platform linux/arm64 \
+		-e DISCORD_APPLICATION_ID \
+		-e DISCORD_PUBLIC_KEY \
+		-e DISCORD_TOKEN \
+		-e DISCORD_GUILD_ID \
+		-e OPENAI_TOKEN \
+		--rm -it $(APP_NAME)
+
 
 terraform-init: $(TF_SRCS)
 	cd infra && terraform init
