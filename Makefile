@@ -7,8 +7,17 @@ AWS_COMMAND := aws-vault exec $(AWS_PROFILE) --region us-west-2 --
 
 .PHONY: clean
 
+init:
+	brew install aws-vault
+	brew install awscli
+	brew install docker-credential-helper-ecr
+	brew install jq
+
 build-bot: $(GO_SRCS)
 	cd src && docker buildx build --platform linux/arm64 -t $(APP_NAME) .
+
+build-push-image:
+	$(AWS_COMMAND) ./infra/build-push-image.sh
 
 clean:
 	rm -rf build/*

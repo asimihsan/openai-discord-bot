@@ -12,18 +12,17 @@ terraform {
     }
 }
 
-data "aws_region" "current" {
-}
-
 provider "aws" {
   region = "us-west-2"
 }
 
 locals {
     application = "openai-discord-bot"
+    environment = "production"
     s3_origin_id = "my_s3_origin"
     tags = {
         Application = local.application
+        Environment = local.environment
     }
 }
 
