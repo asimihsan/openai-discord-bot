@@ -13,7 +13,7 @@ build-bot: $(GO_SRCS)
 clean:
 	rm -rf build/*
 
-run:
+run: build-bot
 	source env.sh && $(AWS_COMMAND) docker run \
 		--platform linux/arm64 \
 		-e DISCORD_APPLICATION_ID \
@@ -21,6 +21,11 @@ run:
 		-e DISCORD_TOKEN \
 		-e DISCORD_GUILD_ID \
 		-e OPENAI_TOKEN \
+		-e LOCK_TABLE_NAME \
+		-e AWS_REGION \
+		-e AWS_ACCESS_KEY_ID \
+		-e AWS_SECRET_ACCESS_KEY \
+		-e AWS_SESSION_TOKEN \
 		--rm -it $(APP_NAME)
 
 

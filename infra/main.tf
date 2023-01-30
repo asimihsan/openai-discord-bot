@@ -166,13 +166,13 @@ resource "aws_dynamodb_table" "bot_lock_table" {
     }
 
     attribute {
-        name = "PendingShard"
+        name = "Shard"
         type = "N"
     }
 
     global_secondary_index {
-        name = "PendingShardIndex"
-        hash_key = "PendingShard"
+        name = "ShardIndex"
+        hash_key = "Shard"
         range_key = "LastUpdated"
         projection_type = "ALL"
     }

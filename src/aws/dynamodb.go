@@ -5,28 +5,40 @@ import (
 	"errors"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	dynamodb_types "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/gofrs/uuid"
+	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
+	"math/rand"
 	"strconv"
+	"sync"
 	"time"
 )
 
 var (
 	LockCurrentlyUnavailableError = errors.New("lock is currently unavailable")
+	LockNotFoundError             = errors.New("lock not found")
+	LockHeartbeatFailedError      = errors.New("failed to heartbeat lock")
+	LockReleaseFailedError        = errors.New("failed to release lock")
 )
 
 type DynamoDBLockConfig struct {
-	Owner                string
-	MaxShards            int
-	LeaseDurationSeconds int
+	Owner                    string
+	MaxShards                int
+	LeaseDurationSeconds     int
+	HeartbeatIntervalSeconds int
 }
 
-type DynamoDBLockClient[T any] struct {
-	Client    *dynamodb.Client
-	TableName string
-	Config    DynamoDBLockConfig
+type DynamoDBLockClient struct {
+	Client             *dynamodb.Client
+	TableName          string
+	Config             DynamoDBLockConfig
+	locks              map[string]Lock
+	mu                 sync.Mutex
+	stopBackgroundJobs chan struct{}
+	zlog               *zerolog.Logger
 }
 
 func NewDynamoDBClient(region string) (*dynamodb.Client, error) {
@@ -39,181 +51,415 @@ func NewDynamoDBClient(region string) (*dynamodb.Client, error) {
 	return dynamodb.NewFromConfig(cfg), nil
 }
 
-func NewDynamoDBLockClient[T any](
+func NewDynamoDBLockClient(
 	tableName string,
 	region string,
 	config DynamoDBLockConfig,
-) (*DynamoDBLockClient[T], error) {
+	zlog *zerolog.Logger,
+) (*DynamoDBLockClient, error) {
 	client, err := NewDynamoDBClient(region)
 	if err != nil {
 		return nil, err
 	}
 
-	return &DynamoDBLockClient[T]{
+	d := DynamoDBLockClient{
 		Client:    client,
 		TableName: tableName,
 		Config:    config,
-	}, nil
+		locks:     make(map[string]Lock),
+		zlog:      zlog,
+	}
+
+	// Start a background job that once a minute heartbeat all locks that we own. There is another
+	// channel that tells the background job to stop.
+	go func() {
+		ticker := time.NewTicker(time.Duration(d.Config.HeartbeatIntervalSeconds) * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				zlog.Debug().Msg("heartbeat")
+				d.mu.Lock()
+
+				var wg sync.WaitGroup
+				var errs multierror.Error
+				for _, lock := range d.locks {
+					if lock.Owner == d.Config.Owner {
+						zlog.Debug().Str("id", lock.ID).Msg("heartbeat lock")
+						wg.Add(1)
+						go func(lock Lock) {
+							defer wg.Done()
+							err := d.Heartbeat(context.TODO(), lock.ID, nil)
+							if err != nil {
+								errs.Errors = append(errs.Errors, err)
+							}
+						}(lock)
+					}
+				}
+				wg.Wait()
+				if len(errs.Errors) > 0 {
+					zlog.Error().Err(errs.ErrorOrNil()).Msg("failed to heartbeat locks")
+				}
+
+				d.mu.Unlock()
+			case <-d.stopBackgroundJobs:
+				zlog.Debug().Msg("stopping background heartbeat job")
+				return
+			}
+		}
+	}()
+
+	return &d, nil
 }
 
-func (d *DynamoDBLockClient[T]) Acquire(
+func (d *DynamoDBLockClient) Close() error {
+	d.stopBackgroundJobs <- struct{}{}
+	return nil
+}
+
+func (d *DynamoDBLockClient) Acquire(
 	ctx context.Context,
 	id string,
-	data T,
-	zlog *zerolog.Logger,
-) (*Lock[T], error) {
-	// The DynamoDB table has a hash key LockID string.
-	// First try to get the lock by LockID.
-	// If the lock is not acquired, then try to acquire it by setting the lock with the LockExpirationTime
-	// field set to the current time + the Lock duration.
-	// If the lock is acquired, then return the lock.
-	// If the lock is not acquired, then return an error.
-
-	// Put the lock in the table if 1) the lock is not in the table or 2) the lock is in the table and the
-	// LockExpirationTime is less than the current time.
-
+	data LockDataType,
+) (*Lock, error) {
 	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
-	existingLock, err := d.getLock(ctx, id, zlog)
+	existingLock, err := d.getLock(ctx, id)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to get lock")
+		d.zlog.Error().Err(err).Msg("failed to get lock")
 		return nil, err
 	}
 	if existingLock != nil {
 		if !existingLock.IsExpired(nowMilliseconds) {
-			zlog.Debug().Msg("lock is already acquired and not expired")
+			d.zlog.Debug().Msg("lock is already acquired and not expired")
 			return existingLock, LockCurrentlyUnavailableError
 		}
-		zlog.Debug().Msg("lock is already acquired but expired")
+
+		d.zlog.Debug().Msg("lock is already acquired but expired")
+		newLock, err := d.updateExistingLock(ctx, *existingLock, data, nowMilliseconds)
+		if err != nil {
+			d.zlog.Error().Err(err).Msg("failed to update existing lock")
+			return nil, err
+		}
+
+		return newLock, nil
 	}
 
-	zlog.Debug().Msg("lock is not acquired")
+	d.zlog.Debug().Msg("lock is not acquired")
+	lock, err := d.putNewLock(ctx, id, data, nowMilliseconds)
+	if err != nil {
+		return nil, err
+	}
+
+	return lock, nil
 }
 
-func (d *DynamoDBLockClient[T]) Heartbeat(ctx context.Context, id string, lock Lock[T]) error {
-	panic("implement me")
+func (d *DynamoDBLockClient) Heartbeat(
+	ctx context.Context,
+	id string,
+	maybeNewData *LockDataType,
+) error {
+	zlog := d.zlog.With().Str("id", id).Logger()
+	zlog.Debug().Msg("heartbeat")
+
+	existingLock, ok := d.getLocalLock(id)
+	if !ok {
+		return LockNotFoundError
+	}
+
+	var newData LockDataType
+	if maybeNewData != nil {
+		newData = *maybeNewData
+	} else {
+		newData = existingLock.Data
+	}
+
+	var resultError multierror.Error
+	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
+	_, err := d.updateExistingLock(ctx, existingLock, newData, nowMilliseconds)
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to update existing lock")
+		resultError = *multierror.Append(&resultError, err, LockHeartbeatFailedError)
+	}
+
+	return resultError.ErrorOrNil()
 }
 
-func (d *DynamoDBLockClient[T]) Release(ctx context.Context, id string, lock Lock[T]) error {
-	panic("implement me")
+func (d *DynamoDBLockClient) Release(ctx context.Context, id string) error {
+	existingLock, ok := d.getLocalLock(id)
+	if !ok {
+		return LockNotFoundError
+	}
+
+	var resultError multierror.Error
+	err := d.deleteLock(ctx, existingLock)
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to delete lock")
+		resultError = *multierror.Append(&resultError, err, LockReleaseFailedError)
+	}
+
+	return resultError.ErrorOrNil()
 }
 
 // getLock returns the lock with the given ID. If the lock is not found, then it returns nil.
-func (d *DynamoDBLockClient[T]) getLock(
+func (d *DynamoDBLockClient) getLock(
 	ctx context.Context,
 	id string,
-	zlog *zerolog.Logger,
-) (*Lock[T], error) {
+) (*Lock, error) {
 	resp, err := d.Client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &d.TableName,
-		Key: map[string]dynamodb_types.AttributeValue{
-			"LockID": &dynamodb_types.AttributeValueMemberS{
+		Key: map[string]dynamodbtypes.AttributeValue{
+			"LockID": &dynamodbtypes.AttributeValueMemberS{
 				Value: id,
 			},
 		},
 		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to get lock")
+		d.zlog.Error().Err(err).Msg("failed to get lock")
 		return nil, err
 	}
 	if resp.Item == nil {
-		zlog.Debug().Msg("lock not found")
+		d.zlog.Debug().Msg("lock not found")
 		return nil, nil
 	}
 
-	owner := resp.Item["Owner"].(*dynamodb_types.AttributeValueMemberS).Value
-	leaseDurationMilliseconds, err := strconv.Atoi(resp.Item["LeaseDurationMilliseconds"].(*dynamodb_types.AttributeValueMemberN).Value)
+	owner := resp.Item["Owner"].(*dynamodbtypes.AttributeValueMemberS).Value
+	leaseDurationMilliseconds, err := strconv.Atoi(resp.Item["LeaseDurationMilliseconds"].(*dynamodbtypes.AttributeValueMemberN).Value)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to parse lease duration")
+		d.zlog.Error().Err(err).Msg("failed to parse lease duration")
 		return nil, err
 	}
-	lastUpdatedTimeMilliseconds, err := strconv.Atoi(resp.Item["LastUpdatedTimeMilliseconds"].(*dynamodb_types.AttributeValueMemberN).Value)
+	lastUpdatedTimeMilliseconds, err := strconv.Atoi(resp.Item["LastUpdatedTimeMilliseconds"].(*dynamodbtypes.AttributeValueMemberN).Value)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to parse last updated time")
+		d.zlog.Error().Err(err).Msg("failed to parse last updated time")
 		return nil, err
 	}
-	recordVersionNumber := resp.Item["RecordVersionNumber"].(*dynamodb_types.AttributeValueMemberS).Value
-	dataSerialized := resp.Item["Data"].(*dynamodb_types.AttributeValueMemberS).Value
-	data, err := Deserialize(dataSerialized)
+	recordVersionNumber := resp.Item["RecordVersionNumber"].(*dynamodbtypes.AttributeValueMemberS).Value
+	shard, err := strconv.Atoi(resp.Item["Shard"].(*dynamodbtypes.AttributeValueMemberN).Value)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to deserialize data")
+		d.zlog.Error().Err(err).Msg("failed to parse shard")
+		return nil, err
+	}
+	ttl, err := strconv.Atoi(resp.Item["TTL"].(*dynamodbtypes.AttributeValueMemberN).Value)
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to parse TTL")
+		return nil, err
+	}
+	dataSerialized := resp.Item["Data"].(*dynamodbtypes.AttributeValueMemberB).Value
+	var data LockDataType
+	err = data.Unmarshal(dataSerialized)
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to deserialize data")
 		return nil, err
 	}
 
-	return Ptr(NewLock[T](
+	newLock := PtrToLock(NewLock(
 		id,
 		owner,
 		int64(leaseDurationMilliseconds),
 		int64(lastUpdatedTimeMilliseconds),
 		recordVersionNumber,
+		int64(shard),
+		int64(ttl),
 		data,
-	)), nil
+	))
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.locks[id] = *newLock
+
+	return newLock, nil
 }
 
-func (d *DynamoDBLockClient[T]) putNewLock(
+func (d *DynamoDBLockClient) updateExistingLock(
 	ctx context.Context,
-	id string,
-	data T,
-	zlog *zerolog.Logger,
-) error {
-	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
+	existingLock Lock,
+	newData LockDataType,
+	nowMilliseconds int64,
+) (*Lock, error) {
 	leaseDurationMilliseconds := int64(d.Config.LeaseDurationSeconds) * int64(time.Second) / int64(time.Millisecond)
-	serializedData, err := Serialize(data)
+	newRecordVersionNumber, err := uuid.NewV6()
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to serialize data")
-		return err
+		d.zlog.Error().Err(err).Msg("failed to generate record version number")
+		return nil, err
 	}
-	recordVersionNumber, err := uuid.NewV6()
+	newTtl := nowMilliseconds/1000 + 10*leaseDurationMilliseconds/1000
+
+	newLock := NewLock(
+		existingLock.ID,
+		d.Config.Owner,
+		leaseDurationMilliseconds,
+		nowMilliseconds,
+		newRecordVersionNumber.String(),
+		existingLock.Shard,
+		newTtl,
+		newData,
+	)
+	item, err := lockToDynamoDBAttributeValues(newLock)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to generate record version number")
-		return err
+		d.zlog.Error().Err(err).Msg("failed to convert lock to dynamodb attribute values")
+		return nil, err
 	}
 
-	// Put the lock into the table, but use a condition expression to ensure that the lock is not already in the table.
-	lock := NewLock[T](
+	conditionSameRecordVersionNumber := expression.Name("RecordVersionNumber").Equal(expression.Value(existingLock.RecordVersionNumber))
+	conditionSameOwner := expression.Name("Owner").Equal(expression.Value(existingLock.Owner))
+	conditionDifferentOwner := expression.Name("Owner").NotEqual(expression.Value(existingLock.Owner))
+	conditionExpired := expression.Name("LastUpdatedTimeMilliseconds").LessThan(expression.Value(nowMilliseconds - leaseDurationMilliseconds))
+	condition := conditionSameRecordVersionNumber.And(conditionSameOwner.Or(conditionDifferentOwner.And(conditionExpired)))
+	builder := expression.NewBuilder()
+	builder = builder.WithCondition(condition)
+	expr, err := builder.Build()
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to build expression")
+		return nil, err
+	}
+
+	_, err = d.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 &d.TableName,
+		Item:                      item,
+		ConditionExpression:       expr.Condition(),
+		ExpressionAttributeNames:  expr.Names(),
+		ExpressionAttributeValues: expr.Values(),
+	})
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to update lock")
+		return nil, err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.locks[existingLock.ID] = newLock
+
+	return &newLock, nil
+}
+
+func (d *DynamoDBLockClient) putNewLock(
+	ctx context.Context,
+	id string,
+	data LockDataType,
+	nowMilliseconds int64,
+) (*Lock, error) {
+	leaseDurationMilliseconds := int64(d.Config.LeaseDurationSeconds) * int64(time.Second) / int64(time.Millisecond)
+	recordVersionNumber, err := uuid.NewV6()
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to generate record version number")
+		return nil, err
+	}
+	shard := rand.Intn(d.Config.MaxShards)
+	ttl := nowMilliseconds/1000 + int64(d.Config.LeaseDurationSeconds)*10
+
+	lock := NewLock(
 		id,
 		d.Config.Owner,
 		leaseDurationMilliseconds,
 		nowMilliseconds,
 		recordVersionNumber.String(),
+		int64(shard),
+		ttl,
 		data,
 	)
 	item, err := lockToDynamoDBAttributeValues(lock)
 	if err != nil {
-		zlog.Error().Err(err).Msg("failed to convert lock to DynamoDB attribute values")
-		return err
+		d.zlog.Error().Err(err).Msg("failed to convert lock to DynamoDB attribute values")
+		return nil, err
+	}
+
+	builder := expression.NewBuilder()
+	builder = builder.WithCondition(expression.Name("LockID").AttributeNotExists())
+	expr, err := builder.Build()
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to build expression")
+		return nil, err
 	}
 
 	_, err = d.Client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:           &d.TableName,
-		Item:                item,
-		ConditionExpression: aws.String("attribute_not_exists(LockID)"),
+		TableName:                 &d.TableName,
+		Item:                      item,
+		ConditionExpression:       expr.Condition(),
+		ExpressionAttributeNames:  expr.Names(),
+		ExpressionAttributeValues: expr.Values(),
 	})
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to put lock")
+		return nil, err
+	}
+
+	return PtrToLock(lock), nil
 }
 
-func lockToDynamoDBAttributeValues[T any](lock Lock[T]) (map[string]dynamodb_types.AttributeValue, error) {
-	serializedData, err := Serialize(lock.Data)
+func (d *DynamoDBLockClient) deleteLock(
+	ctx context.Context,
+	existingLock Lock,
+) error {
+	conditionSameRecordVersionNumber := expression.Name("RecordVersionNumber").Equal(expression.Value(existingLock.RecordVersionNumber))
+	conditionSameOwner := expression.Name("Owner").Equal(expression.Value(d.Config.Owner))
+	condition := conditionSameRecordVersionNumber.And(conditionSameOwner)
+	builder := expression.NewBuilder()
+	builder = builder.WithCondition(condition)
+	expr, err := builder.Build()
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to build expression")
+		return err
+	}
+
+	_, err = d.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &d.TableName,
+		Key: map[string]dynamodbtypes.AttributeValue{
+			"LockID": &dynamodbtypes.AttributeValueMemberS{
+				Value: existingLock.ID,
+			},
+		},
+		ConditionExpression:       expr.Condition(),
+		ExpressionAttributeNames:  expr.Names(),
+		ExpressionAttributeValues: expr.Values(),
+	})
+	if err != nil {
+		d.zlog.Error().Err(err).Msg("failed to delete lock")
+		return err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.locks, existingLock.ID)
+
+	return nil
+}
+
+func (d *DynamoDBLockClient) getLocalLock(id string) (Lock, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	lock, ok := d.locks[id]
+	return lock, ok
+}
+
+func lockToDynamoDBAttributeValues(lock Lock) (map[string]dynamodbtypes.AttributeValue, error) {
+	serializedData, err := lock.Data.Marshal()
 	if err != nil {
 		return nil, err
 	}
-	return map[string]dynamodb_types.AttributeValue{
-		"LockID": &dynamodb_types.AttributeValueMemberS{
+	return map[string]dynamodbtypes.AttributeValue{
+		"LockID": &dynamodbtypes.AttributeValueMemberS{
 			Value: lock.ID,
 		},
-		"Owner": &dynamodb_types.AttributeValueMemberS{
+		"Owner": &dynamodbtypes.AttributeValueMemberS{
 			Value: lock.Owner,
 		},
-		"LeaseDurationMilliseconds": &dynamodb_types.AttributeValueMemberN{
+		"LeaseDurationMilliseconds": &dynamodbtypes.AttributeValueMemberN{
 			Value: strconv.Itoa(int(lock.LeaseDurationMilliseconds)),
 		},
-		"LastUpdatedTimeMilliseconds": &dynamodb_types.AttributeValueMemberN{
+		"LastUpdatedTimeMilliseconds": &dynamodbtypes.AttributeValueMemberN{
 			Value: strconv.Itoa(int(lock.LastUpdatedTimeMilliseconds)),
 		},
-		"RecordVersionNumber": &dynamodb_types.AttributeValueMemberS{
+		"RecordVersionNumber": &dynamodbtypes.AttributeValueMemberS{
 			Value: lock.RecordVersionNumber,
 		},
-		"Data": &dynamodb_types.AttributeValueMemberS{
+		"Data": &dynamodbtypes.AttributeValueMemberB{
 			Value: serializedData,
+		},
+		"Shard": &dynamodbtypes.AttributeValueMemberN{
+			Value: strconv.Itoa(int(lock.Shard)),
+		},
+		"TTL": &dynamodbtypes.AttributeValueMemberN{
+			Value: strconv.Itoa(int(lock.TTLEpochSeconds)),
 		},
 	}, nil
 }

@@ -8,8 +8,9 @@ RUN \
     apt-get install -y ca-certificates git 
 
 WORKDIR /go/src/hello
-COPY . .
+COPY go.mod .
 RUN go mod download
+COPY . .
 RUN go build -o /godocker
 
 FROM debian:bullseye-slim
