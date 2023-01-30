@@ -4,19 +4,6 @@ import (
 	"context"
 )
 
-type Marshaler interface {
-	Marshal() ([]byte, error)
-}
-
-type Unmarshaler interface {
-	Unmarshal([]byte) error
-}
-
-type LockDataType interface {
-	Marshaler
-	Unmarshaler
-}
-
 type Lock struct {
 	ID                          string
 	Owner                       string
@@ -25,7 +12,7 @@ type Lock struct {
 	RecordVersionNumber         string
 	Shard                       int64
 	TTLEpochSeconds             int64
-	Data                        LockDataType
+	Data                        interface{}
 }
 
 func (l *Lock) IsExpired(nowMilliseconds int64) bool {
@@ -33,10 +20,11 @@ func (l *Lock) IsExpired(nowMilliseconds int64) bool {
 }
 
 type LockClient interface {
-	Acquire(ctx context.Context, id string, data LockDataType) (*Lock, error)
-	Heartbeat(ctx context.Context, id string, maybeNewData *LockDataType) error
+	Acquire(ctx context.Context, id string, data interface{}) (*Lock, error)
+	Heartbeat(ctx context.Context, id string, maybeNewData *interface{}) error
 	Release(ctx context.Context, id string) error
 	Close() error
+	Owner() string
 }
 
 func NewLock(
@@ -47,7 +35,7 @@ func NewLock(
 	RecordVersionNumber string,
 	Shard int64,
 	TTLEpochSeconds int64,
-	Data LockDataType,
+	Data interface{},
 ) Lock {
 	return Lock{
 		ID:                          ID,

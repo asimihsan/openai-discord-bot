@@ -1,10 +1,9 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/pkgerrors"
 	"os"
 	"os/signal"
 	"src/aws"
@@ -30,14 +29,6 @@ var (
 
 type LockData struct {
 	MessageID string `json:"message_id"`
-}
-
-func (l LockData) Marshal() ([]byte, error) {
-	return json.Marshal(l)
-}
-
-func (l LockData) Unmarshal(data []byte) error {
-	return json.Unmarshal(data, &l)
 }
 
 func getLockClient(zlog *zerolog.Logger) (aws.LockClient, error) {
@@ -79,6 +70,8 @@ func getLockClient(zlog *zerolog.Logger) (aws.LockClient, error) {
 func main() {
 	zlog := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	zerolog.TimeFieldFormat = time.RFC3339Nano
+	zerolog.ErrorStackMarshaler = pkgerrors.MarshalStack
+	zlog = zlog.Level(zerolog.DebugLevel).With().Caller().Logger()
 
 	openaiToken, ok := os.LookupEnv(openaiTokenEnvName)
 	if !ok {
@@ -104,12 +97,6 @@ func main() {
 		}
 	}(lockClient)
 
-	// TODO REMOVEME do a test acquire of a lock
-	_, err = lockClient.Acquire(context.TODO(), "test", LockData{MessageID: "message-id"})
-	if err != nil {
-		zlog.Fatal().Err(err).Msg("Failed to acquire lock")
-	}
-
 	discordToken, ok := os.LookupEnv(discordTokenEnvName)
 	if !ok {
 		zlog.Fatal().Msgf("Missing %s environment variable", discordTokenEnvName)
@@ -119,7 +106,12 @@ func main() {
 		zlog.Fatal().Msgf("Missing %s environment variable", guildIDTokenEnvName)
 	}
 
-	discordBot, err := discord.NewDiscord(discordToken, openaiClient, guildID, &zlog)
+	discordBot, err := discord.NewDiscord(
+		discordToken,
+		openaiClient,
+		lockClient,
+		guildID,
+		&zlog)
 	if err != nil {
 		fmt.Println(err)
 		return

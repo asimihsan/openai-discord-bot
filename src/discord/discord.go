@@ -7,6 +7,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
+	"src/aws"
 	"src/openai"
 	"strings"
 )
@@ -18,6 +19,7 @@ type Config struct {
 type Discord struct {
 	discordClient      *discordgo.Session
 	openaiClient       *openai.OpenAI
+	lockClient         aws.LockClient
 	registeredCommands []*discordgo.ApplicationCommand
 	config             Config
 	zlog               *zerolog.Logger
@@ -84,6 +86,18 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 	d.discordClient.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
+				prompt := getPayloadFromIteraction(i)
+				lock, err := d.lockClient.Acquire(context.Background(), i.ID, prompt)
+				if err != nil {
+					zlog.Error().Err(err).Msg("Failed to acquire lock")
+					return
+				}
+				defer func() {
+					if err := d.lockClient.Release(context.Background(), lock.ID); err != nil {
+						zlog.Error().Err(err).Msg("Failed to release lock")
+					}
+				}()
+
 				if err := d.deferInteractionReply(s, i); err != nil {
 					return
 				}
@@ -124,7 +138,13 @@ func (d *Discord) DebugApplicationCommands() {
 	}
 }
 
-func NewDiscord(discordToken string, openaiClient *openai.OpenAI, guildID string, zlog *zerolog.Logger) (*Discord, error) {
+func NewDiscord(
+	discordToken string,
+	openaiClient *openai.OpenAI,
+	lockClient aws.LockClient,
+	guildID string,
+	zlog *zerolog.Logger,
+) (*Discord, error) {
 	discordClient, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
 		zlog.Error().Err(err).Msg("failed to create Discord client")
@@ -134,6 +154,7 @@ func NewDiscord(discordToken string, openaiClient *openai.OpenAI, guildID string
 	discord := Discord{
 		discordClient: discordClient,
 		openaiClient:  openaiClient,
+		lockClient:    lockClient,
 		config: Config{
 			RemoveCommands: false,
 		},
@@ -186,12 +207,7 @@ func (d *Discord) pingInteractionHandler(s *discordgo.Session, i *discordgo.Inte
 }
 
 func (d *Discord) completeInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Get the payload from the interaction.
-	payload := i.ApplicationCommandData()
-	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received command")
-
-	// Get the prompt from the payload.
-	prompt := strings.TrimSpace(payload.Options[0].StringValue())
+	prompt := getPayloadFromIteraction(i)
 
 	// Get the completion from OpenAI.
 	ctx := context.Background()
@@ -216,12 +232,7 @@ func (d *Discord) completeInteractionHandler(s *discordgo.Session, i *discordgo.
 }
 
 func (d *Discord) createImageInteractionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Get the payload from the interaction.
-	payload := i.ApplicationCommandData()
-	d.zlog.Info().Str("command", payload.Name).Interface("payload", payload).Msg("Received command")
-
-	// Get the prompt from the payload.
-	prompt := strings.TrimSpace(payload.Options[0].StringValue())
+	prompt := getPayloadFromIteraction(i)
 
 	// Get the image URLs from OpenAI.
 	ctx := context.Background()
@@ -271,7 +282,22 @@ func (d *Discord) Close(zlog *zerolog.Logger) error {
 		zlog.Error().Err(err).Msg("Failed to close Discord client")
 		resultError = multierror.Append(resultError, err)
 	}
+
+	err = d.lockClient.Close()
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to close lock client")
+		resultError = multierror.Append(resultError, err)
+	}
+
 	return resultError
+}
+
+func getPayloadFromIteraction(i *discordgo.InteractionCreate) string {
+	payload := i.ApplicationCommandData()
+	if len(payload.Options) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(payload.Options[0].StringValue())
 }
 
 func Ptr[T any](t T) *T {
