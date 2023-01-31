@@ -17,11 +17,10 @@ provider "aws" {
 }
 
 locals {
-    application = "openai-discord-bot"
     environment = "production"
     s3_origin_id = "my_s3_origin"
     tags = {
-        Application = local.application
+        Application = var.application
         Environment = local.environment
     }
 }

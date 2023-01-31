@@ -1,5 +1,5 @@
 resource "aws_ecr_repository" "ecr_repo" {
-  name                 = "${local.application}-${random_id.application.hex}-${local.environment}"
+  name                 = "${var.application}-${random_id.application.hex}-${local.environment}"
   image_tag_mutability = "MUTABLE"
   force_delete         = true
 
@@ -8,7 +8,7 @@ resource "aws_ecr_repository" "ecr_repo" {
 }
 
 resource "aws_cloudwatch_log_group" "log_group" {
-  name              = "/aws/ecs/${local.application}-${local.environment}-${random_id.application.hex}"
+  name              = "/aws/ecs/${var.application}-${local.environment}-${random_id.application.hex}"
   retention_in_days = 30
 
   tags = merge(local.tags, {
@@ -16,7 +16,7 @@ resource "aws_cloudwatch_log_group" "log_group" {
 }
 
 resource "aws_ecs_cluster" "ecs_cluster" {
-  name = "${local.application}-${local.environment}-${random_id.application.hex}"
+  name = "${var.application}-${local.environment}-${random_id.application.hex}"
 
   configuration {
     execute_command_configuration {
@@ -32,6 +32,106 @@ resource "aws_ecs_cluster" "ecs_cluster" {
   })
 }
 
+# IAM task role for ECS tasks.
+resource "aws_iam_role" "ecs_task_role" {
+  name               = "${var.application}-${local.environment}-${random_id.application.hex}-ecs-task-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      },
+    ]
+  })
+
+  tags = merge(local.tags, {
+  })
+}
+
+# Attach SSM policies to ECS task role.
+resource "aws_iam_role_policy_attachment" "ecs_task_role_ssm" {
+  role       = aws_iam_role.ecs_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Attach CloudWatch policies to ECS task role.
+resource "aws_iam_role_policy_attachment" "ecs_task_role_cloudwatch" {
+  role       = aws_iam_role.ecs_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# Deploy ECS image var.application to ECS cluster.
+resource "aws_ecs_task_definition" "task_definition" {
+  family                   = "${var.application}-${local.environment}-${random_id.application.hex}"
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "256"
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = var.application
+      image     = "${aws_ecr_repository.ecr_repo.repository_url}:${var.application}"
+      essential = true
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.log_group.name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+    },
+  ])
+
+  tags = merge(local.tags, {
+  })
+}
+
+resource "aws_security_group" "ecs_service" {
+  name        = "${var.application}-${local.environment}-${random_id.application.hex}-ecs-service"
+  description = "Allow outbound traffic from ECS service."
+  vpc_id      = aws_vpc.vpc.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_ecs_service" "ecs_service" {
+  name            = "${var.application}-${local.environment}-${random_id.application.hex}"
+  cluster         = aws_ecs_cluster.ecs_cluster.id
+  task_definition = aws_ecs_task_definition.task_definition.arn
+  desired_count   = 0
+  depends_on      = [
+    aws_cloudwatch_log_group.log_group,
+    aws_iam_role.ecs_task_role,
+  ]
+  launch_type     = "EC2"
+
+  network_configuration {
+    subnets          = aws_subnet.public_subnet.*.id
+    security_groups  = [aws_security_group.ecs_service.id]
+  }
+
+  lifecycle {
+    ignore_changes = [
+      desired_count,
+    ]
+  }
+
+  tags = merge(local.tags, {
+  })
+}
+
 # VPC with two public subnets, IGW, and routing.
 resource "aws_vpc" "vpc" {
   cidr_block           = "10.0.0.0/16"
@@ -39,7 +139,7 @@ resource "aws_vpc" "vpc" {
   enable_dns_support   = true
 
   tags = merge(local.tags, {
-    Name = "${local.application}-${local.environment}-${random_id.application.hex}-vpc"
+    Name = "${var.application}-${local.environment}-${random_id.application.hex}-vpc"
   })
 }
 
@@ -47,7 +147,7 @@ resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.vpc.id
 
   tags = merge(local.tags, {
-    Name = "${local.application}-${local.environment}-${random_id.application.hex}-igw"
+    Name = "${var.application}-${local.environment}-${random_id.application.hex}-igw"
   })
 }
 
@@ -59,7 +159,7 @@ resource "aws_subnet" "public_subnet" {
   availability_zone       = data.aws_availability_zones.available.names[count.index]
 
   tags = merge(local.tags, {
-    Name = "${local.application}-${local.environment}-${random_id.application.hex}-public-subnet-${count.index}"
+    Name = "${var.application}-${local.environment}-${random_id.application.hex}-public-subnet-${count.index}"
   })
 }
 
@@ -72,7 +172,7 @@ resource "aws_route_table" "public_route_table" {
   }
 
   tags = merge(local.tags, {
-    Name = "${local.application}-${local.environment}-${random_id.application.hex}-public-route-table"
+    Name = "${var.application}-${local.environment}-${random_id.application.hex}-public-route-table"
   })
 }
 
@@ -83,8 +183,8 @@ resource "aws_route_table_association" "public_route_table_association" {
 }
 
 resource "aws_security_group" "security_group" {
-  name        = "${local.application}-${local.environment}-${random_id.application.hex}-security-group"
-  description = "Security group for ${local.application}-${local.environment}-${random_id.application.hex}"
+  name        = "${var.application}-${local.environment}-${random_id.application.hex}-security-group"
+  description = "Security group for ${var.application}-${local.environment}-${random_id.application.hex}"
   vpc_id      = aws_vpc.vpc.id
 
   egress {
@@ -102,23 +202,52 @@ resource "aws_security_group" "security_group" {
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
 data "aws_ami" "ecs-optimized" {
   most_recent = true
+  owners = ["amazon"]
 
   filter {
     name   = "name"
     values = ["amzn2-ami-ecs-hvm-*-arm64-ebs"]
   }
+}
 
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+# IAM instance role for EC2 instances in ASG. Then attach AmazonEC2ContainerServiceforEC2Role to them.
+resource "aws_iam_role" "ecs_instance_role" {
+  name               = "${var.application}-${local.environment}-${random_id.application.hex}-ecs-instance-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
 
-  owners = ["amazon"]
+resource "aws_iam_role_policy_attachment" "ecs_instance_role_for_ec2" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_instance_role_for_ec2" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ecs_instance_role" {
+  name = aws_iam_role.ecs_instance_role.name
+  role = aws_iam_role.ecs_instance_role.name
 }
 
 resource "aws_launch_template" "launch_template" {
-  name_prefix   = "${local.application}-${local.environment}-${random_id.application.hex}-launch-template"
+  name_prefix   = "${var.application}-${local.environment}-${random_id.application.hex}-launch-template"
   image_id      = data.aws_ami.ecs-optimized.id
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.ecs_instance_role.arn
+  }
   instance_type = "t4g.nano"
 
   instance_market_options {
@@ -132,18 +261,26 @@ resource "aws_launch_template" "launch_template" {
   }
 
   network_interfaces {
-    associate_public_ip_address = true
     delete_on_termination       = true
     device_index                = 0
     security_groups             = [aws_security_group.security_group.id]
+    associate_public_ip_address = true
   }
+
+  # User data must include the following line to enable ECS agent
+  # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/launch_container_instance.html
+  user_data = base64encode(
+    templatefile("${path.module}/user_data.sh", {
+      cluster_name = aws_ecs_cluster.ecs_cluster.name
+    })
+  )
 
   tags = merge(local.tags, {
   })
 }
 
 resource "aws_autoscaling_group" "asg" {
-  name                      = "${local.application}-${local.environment}-${random_id.application.hex}"
+  name                      = "${var.application}-${local.environment}-${random_id.application.hex}"
   max_size                  = 4
   min_size                  = 1
   desired_capacity          = 1
@@ -157,6 +294,10 @@ resource "aws_autoscaling_group" "asg" {
     version = "$Latest"
   }
 
+  lifecycle {
+    create_before_destroy = true
+  }
+
   dynamic "tag" {
     for_each = local.tags
     content {
@@ -168,7 +309,7 @@ resource "aws_autoscaling_group" "asg" {
 }
 
 resource "aws_ecs_capacity_provider" "ecs_cluster_provider" {
-  name = "${local.application}-${local.environment}-${random_id.application.hex}"
+  name = "${var.application}-${local.environment}-${random_id.application.hex}"
   auto_scaling_group_provider {
     auto_scaling_group_arn = aws_autoscaling_group.asg.arn
     managed_termination_protection = "DISABLED"
@@ -179,7 +320,7 @@ resource "aws_ecs_capacity_provider" "ecs_cluster_provider" {
 }
 
 resource "aws_ecs_cluster_capacity_providers" "ecs_cluster_capacity_providers" {
-  cluster_name = aws_ecs_capacity_provider.ecs_cluster_provider.name
+  cluster_name = aws_ecs_cluster.ecs_cluster.name
   capacity_providers = [aws_ecs_capacity_provider.ecs_cluster_provider.name]
 
   default_capacity_provider_strategy {

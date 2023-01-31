@@ -3,3 +3,9 @@ variable "public_subnet_count" {
     type = number
     default = 2
 }
+
+variable "application" {
+    description = "Name of the application"
+    type = string
+    default = "openai-discord-bot"
+}
