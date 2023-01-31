@@ -12,6 +12,7 @@ init:
 	brew install awscli
 	brew install docker-credential-helper-ecr
 	brew install jq
+	brew install sops
 
 build-bot: $(GO_SRCS)
 	cd src && docker buildx build --platform linux/arm64 -t $(APP_NAME) .
@@ -37,12 +38,11 @@ run: build-bot
 		-e AWS_SESSION_TOKEN \
 		--rm -it $(APP_NAME)
 
-
 terraform-init: $(TF_SRCS)
 	cd infra && terraform init
 
 terraform-plan: terraform-init
-	cd infra && $(AWS_COMMAND) terraform plan
+	cd infra && $(AWS_COMMAND) terraform plan -var-file=secret-variables.tfvars
 
 terraform-apply: terraform-init
-	cd infra && $(AWS_COMMAND) terraform apply
+	cd infra && $(AWS_COMMAND) terraform apply -var-file=secret-variables.tfvars

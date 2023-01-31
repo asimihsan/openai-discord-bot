@@ -64,30 +64,114 @@ resource "aws_iam_role_policy_attachment" "ecs_task_role_cloudwatch" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
+resource "aws_iam_policy" "ecs_task_role_dynamodb" {
+  name        = "${var.application}-${local.environment}-${random_id.application.hex}-ecs-task-role-dynamodb"
+  description = "IAM policy for ECS task role that grants GetItem, PutItem, DeleteItem on ${aws_dynamodb_table.bot_lock_table.name} table."
+  policy      = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem",
+        ]
+        Effect   = "Allow"
+        Resource = [
+          "${aws_dynamodb_table.bot_lock_table.arn}",
+        ]
+      },
+    ]
+  })
+
+  tags = merge(local.tags, {
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_role_dynamodb" {
+  role       = aws_iam_role.ecs_task_role.name
+  policy_arn = aws_iam_policy.ecs_task_role_dynamodb.arn
+}
+
+resource "aws_iam_policy" "ecs_task_role_secretsmanager" {
+  name        = "${var.application}-${local.environment}-${random_id.application.hex}-ecs-task-role-secretsmanager"
+  description = "IAM policy for ECS task role that grants secretsmanager:GetSecretValue for each secret in secret_names_for_ecs_task."
+  policy      = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "secretsmanager:GetSecretValue",
+        ]
+        Effect   = "Allow"
+        Resource = [
+          "${aws_secretsmanager_secret.discord_application_id.arn}",
+          "${aws_secretsmanager_secret.discord_public_key.arn}",
+          "${aws_secretsmanager_secret.discord_token.arn}",
+          "${aws_secretsmanager_secret.discord_guild_id.arn}",
+          "${aws_secretsmanager_secret.openai_token.arn}",
+        ]
+      },
+    ]
+  })
+
+  tags = merge(local.tags, {
+  })
+}
+
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name               = "${random_id.application.hex}-ecs-task-execution-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      },
+    ]
+  })
+
+  tags = merge(local.tags, {
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_secretsmanager" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = aws_iam_policy.ecs_task_role_secretsmanager.arn
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_ecr" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
 # Deploy ECS image var.application to ECS cluster.
+# See: https://www.sufle.io/blog/keeping-secrets-as-secret-on-amazon-ecs-using-terraform
 resource "aws_ecs_task_definition" "task_definition" {
   family                   = "${var.application}-${local.environment}-${random_id.application.hex}"
-  network_mode             = "awsvpc"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  requires_compatibilities = ["EC2"]
   cpu                      = "1024"
   memory                   = "256"
+  network_mode             = "awsvpc"
   task_role_arn            = aws_iam_role.ecs_task_role.arn
-
-  container_definitions = jsonencode([
-    {
-      name      = var.application
-      image     = "${aws_ecr_repository.ecr_repo.repository_url}:${var.application}"
-      essential = true
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.log_group.name
-          "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-    },
-  ])
+  container_definitions    = templatefile("${path.module}/templates/task.json.tpl", {
+    app_name               = var.application
+    app_image              = "${aws_ecr_repository.ecr_repo.repository_url}:${var.application}"
+    app_cpu                = "1024"
+    app_memory             = "256"
+    discord_application_id = aws_secretsmanager_secret.discord_application_id.arn
+    discord_public_key     = aws_secretsmanager_secret.discord_public_key.arn
+    discord_token          = aws_secretsmanager_secret.discord_token.arn
+    discord_guild_id       = aws_secretsmanager_secret.discord_guild_id.arn
+    openai_token           = aws_secretsmanager_secret.openai_token.arn
+    log_group_name         = aws_cloudwatch_log_group.log_group.name
+    region                 = data.aws_region.current.name
+    lock_table_name        = aws_dynamodb_table.bot_lock_table.name
+  })
 
   tags = merge(local.tags, {
   })
