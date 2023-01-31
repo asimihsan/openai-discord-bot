@@ -1,3 +1,9 @@
+variable "scale_down" {
+    description = "Scale down the cluster"
+    type = bool
+    default = false
+}
+
 variable "public_subnet_count" {
     description = "Number of public subnets to create"
     type = number

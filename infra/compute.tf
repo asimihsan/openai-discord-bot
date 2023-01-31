@@ -194,7 +194,7 @@ resource "aws_ecs_service" "ecs_service" {
   name            = "${var.application}-${local.environment}-${random_id.application.hex}"
   cluster         = aws_ecs_cluster.ecs_cluster.id
   task_definition = aws_ecs_task_definition.task_definition.arn
-  desired_count   = 0
+  desired_count   = var.scale_down ? 0 : 1
   depends_on      = [
     aws_cloudwatch_log_group.log_group,
     aws_iam_role.ecs_task_role,
@@ -366,8 +366,8 @@ resource "aws_launch_template" "launch_template" {
 resource "aws_autoscaling_group" "asg" {
   name                      = "${var.application}-${local.environment}-${random_id.application.hex}"
   max_size                  = 4
-  min_size                  = 1
-  desired_capacity          = 1
+  min_size                  = var.scale_down ? 0 : 1
+  desired_capacity          = var.scale_down ? 0 : 1
   health_check_grace_period = 300
   health_check_type         = "EC2"
   force_delete              = true
