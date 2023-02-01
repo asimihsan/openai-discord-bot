@@ -7,6 +7,11 @@ resource "aws_ecr_repository" "ecr_repo" {
   })
 }
 
+data "aws_ecr_image" "ecr_image" {
+  repository_name = aws_ecr_repository.ecr_repo.name
+  image_tag       = "latest"
+}
+
 resource "aws_cloudwatch_log_group" "log_group" {
   name              = "/aws/ecs/${var.application}-${local.environment}-${random_id.application.hex}"
   retention_in_days = 30
@@ -154,15 +159,15 @@ resource "aws_ecs_task_definition" "task_definition" {
   family                   = "${var.application}-${local.environment}-${random_id.application.hex}"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
   requires_compatibilities = ["EC2"]
-  cpu                      = "1024"
-  memory                   = "256"
-  network_mode             = "awsvpc"
+  cpu                      = "768"
+  memory                   = "128"
+  network_mode             = "host"
   task_role_arn            = aws_iam_role.ecs_task_role.arn
   container_definitions    = templatefile("${path.module}/templates/task.json.tpl", {
     app_name               = var.application
-    app_image              = "${aws_ecr_repository.ecr_repo.repository_url}:${var.application}"
-    app_cpu                = "1024"
-    app_memory             = "256"
+    app_image              = "${aws_ecr_repository.ecr_repo.repository_url}:${var.ecr_tag}@${data.aws_ecr_image.ecr_image.image_digest}"
+    app_cpu                = "768"
+    app_memory             = "128"
     discord_application_id = aws_secretsmanager_secret.discord_application_id.arn
     discord_public_key     = aws_secretsmanager_secret.discord_public_key.arn
     discord_token          = aws_secretsmanager_secret.discord_token.arn
@@ -194,22 +199,15 @@ resource "aws_ecs_service" "ecs_service" {
   name            = "${var.application}-${local.environment}-${random_id.application.hex}"
   cluster         = aws_ecs_cluster.ecs_cluster.id
   task_definition = aws_ecs_task_definition.task_definition.arn
-  desired_count   = var.scale_down ? 0 : 1
+  desired_count   = var.scale_down ? 0 : 2
   depends_on      = [
     aws_cloudwatch_log_group.log_group,
     aws_iam_role.ecs_task_role,
   ]
   launch_type     = "EC2"
 
-  network_configuration {
-    subnets          = aws_subnet.public_subnet.*.id
-    security_groups  = [aws_security_group.ecs_service.id]
-  }
-
-  lifecycle {
-    ignore_changes = [
-      desired_count,
-    ]
+  triggers = {
+    redeployment = timestamp()
   }
 
   tags = merge(local.tags, {
@@ -367,7 +365,7 @@ resource "aws_autoscaling_group" "asg" {
   name                      = "${var.application}-${local.environment}-${random_id.application.hex}"
   max_size                  = 4
   min_size                  = var.scale_down ? 0 : 1
-  desired_capacity          = var.scale_down ? 0 : 1
+  desired_capacity          = var.scale_down ? 0 : 2
   health_check_grace_period = 300
   health_check_type         = "EC2"
   force_delete              = true
@@ -375,11 +373,18 @@ resource "aws_autoscaling_group" "asg" {
 
   launch_template {
     id      = aws_launch_template.launch_template.id
-    version = "$Latest"
+    version = aws_launch_template.launch_template.latest_version
   }
 
   lifecycle {
     create_before_destroy = true
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
   }
 
   dynamic "tag" {

@@ -1,3 +1,9 @@
+variable "ecr_tag" {
+    description = "ECR tag"
+    type = string
+    default = "latest"
+}
+
 variable "scale_down" {
     description = "Scale down the cluster"
     type = bool
@@ -7,7 +13,7 @@ variable "scale_down" {
 variable "public_subnet_count" {
     description = "Number of public subnets to create"
     type = number
-    default = 2
+    default = 3
 }
 
 variable "application" {

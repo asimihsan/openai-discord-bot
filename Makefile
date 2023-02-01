@@ -18,7 +18,7 @@ build-bot: $(GO_SRCS)
 	cd src && docker buildx build --platform linux/arm64 -t $(APP_NAME) .
 
 build-push-image:
-	$(AWS_COMMAND) ./infra/build-push-image.sh
+	$(AWS_COMMAND) ./infra/build-push-image.sh latest
 
 clean:
 	rm -rf build/*

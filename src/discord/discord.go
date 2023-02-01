@@ -214,6 +214,12 @@ func (d *Discord) completeInteractionHandler(s *discordgo.Session, i *discordgo.
 	completion, err := d.openaiClient.Complete(prompt, ctx, d.zlog)
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("Failed to get completion from OpenAI")
+
+		// Respond failure to the interaction with the contents of the error message.
+		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: Ptr(err.Error()),
+		})
+
 		return
 	}
 	completion = strings.TrimSpace(completion)
@@ -239,6 +245,12 @@ func (d *Discord) createImageInteractionHandler(s *discordgo.Session, i *discord
 	resp, err := d.openaiClient.CreateImage(prompt, ctx, d.zlog)
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("Failed to get completion from OpenAI")
+
+		// Respond failure to the interaction with the contents of the error message.
+		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: Ptr(err.Error()),
+		})
+
 		return
 	}
 
