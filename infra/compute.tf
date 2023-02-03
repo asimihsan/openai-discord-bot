@@ -380,6 +380,8 @@ resource "aws_autoscaling_group" "asg" {
     create_before_destroy = true
   }
 
+  max_instance_lifetime = 86400
+
   instance_refresh {
     strategy = "Rolling"
     preferences {
@@ -399,9 +401,17 @@ resource "aws_autoscaling_group" "asg" {
 
 resource "aws_ecs_capacity_provider" "ecs_cluster_provider" {
   name = "${var.application}-${local.environment}-${random_id.application.hex}"
+
   auto_scaling_group_provider {
     auto_scaling_group_arn = aws_autoscaling_group.asg.arn
-    managed_termination_protection = "DISABLED"
+    managed_termination_protection = "ENABLED"
+    managed_scaling {
+      status = "ENABLED"
+      target_capacity = 100
+      minimum_scaling_step_size = 1
+      maximum_scaling_step_size = 10000
+      instance_warmup_period = 300
+    }
   }
 
   tags = merge(local.tags, {

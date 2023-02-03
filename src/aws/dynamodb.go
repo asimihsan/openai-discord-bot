@@ -216,7 +216,7 @@ func (d *DynamoDBLockClient) Release(ctx context.Context, id string) error {
 	}
 
 	var resultError multierror.Error
-	err := d.deleteLock(ctx, existingLock)
+	err := d.releaseLock(ctx, existingLock, &zlog)
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("failed to delete lock")
 		resultError = *multierror.Append(&resultError, err, LockReleaseFailedError)
@@ -325,7 +325,7 @@ func (d *DynamoDBLockClient) updateExistingLock(
 ) (*Lock, error) {
 	zlog := d.zlog.With().Str("id", existingLock.ID).Logger()
 	leaseDurationMilliseconds := int64(d.Config.LeaseDurationSeconds) * int64(time.Second) / int64(time.Millisecond)
-	newRecordVersionNumber, err := uuid.NewV6()
+	newRecordVersionNumber, err := uuid.NewV7()
 	if err != nil {
 		zlog.Error().Err(err).Msg("failed to generate record version number")
 		return nil, err
@@ -387,7 +387,7 @@ func (d *DynamoDBLockClient) putNewLock(
 	nowMilliseconds int64,
 ) (*Lock, error) {
 	leaseDurationMilliseconds := int64(d.Config.LeaseDurationSeconds) * int64(time.Second) / int64(time.Millisecond)
-	recordVersionNumber, err := uuid.NewV6()
+	recordVersionNumber, err := uuid.NewV7()
 	if err != nil {
 		d.zlog.Error().Err(err).Msg("failed to generate record version number")
 		return nil, err
@@ -438,9 +438,10 @@ func (d *DynamoDBLockClient) putNewLock(
 	return PtrToLock(lock), nil
 }
 
-func (d *DynamoDBLockClient) deleteLock(
+func (d *DynamoDBLockClient) releaseLock(
 	ctx context.Context,
 	existingLock Lock,
+	zlog *zerolog.Logger,
 ) error {
 	conditionSameRecordVersionNumber := expression.Name("RecordVersionNumber").Equal(expression.Value(existingLock.RecordVersionNumber))
 	conditionSameOwner := expression.Name("Owner").Equal(expression.Value(d.Config.Owner))
@@ -453,19 +454,37 @@ func (d *DynamoDBLockClient) deleteLock(
 		return err
 	}
 
-	_, err = d.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: &d.TableName,
-		Key: map[string]dynamodbtypes.AttributeValue{
-			"LockID": &dynamodbtypes.AttributeValueMemberS{
-				Value: existingLock.ID,
-			},
-		},
+	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
+	newRecordVersionNumber, err := uuid.NewV7()
+	newLock := NewLock(
+		existingLock.ID,
+		d.Config.Owner,
+		existingLock.LeaseDurationMilliseconds,
+		nowMilliseconds,
+		newRecordVersionNumber.String(),
+		existingLock.Shard,
+		existingLock.TTLEpochSeconds,
+		existingLock.Data,
+	)
+	item, err := lockToDynamoDBAttributeValues(newLock)
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to convert lock to dynamodb attribute values")
+		return err
+	}
+
+	// Remove the Shard attribute from the item. This will remove it from the GSI.
+	delete(item, "Shard")
+
+	// Put the item back into the table.
+	_, err = d.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 &d.TableName,
+		Item:                      item,
 		ConditionExpression:       expr.Condition(),
 		ExpressionAttributeNames:  expr.Names(),
 		ExpressionAttributeValues: expr.Values(),
 	})
 	if err != nil {
-		d.zlog.Error().Err(err).Msg("failed to delete lock")
+		d.zlog.Error().Err(err).Msg("failed to release lock")
 		return err
 	}
 

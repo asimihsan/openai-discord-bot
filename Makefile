@@ -46,3 +46,6 @@ terraform-plan: terraform-init
 
 terraform-apply: terraform-init
 	cd infra && $(AWS_COMMAND) terraform apply -var-file=secret-variables.tfvars
+
+terraform-apply-scale-down: terraform-init
+	cd infra && $(AWS_COMMAND) terraform apply -var-file=secret-variables.tfvars -var="scale_down=true"

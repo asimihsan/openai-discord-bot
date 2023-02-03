@@ -3,6 +3,7 @@ package discord
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/hashicorp/go-multierror"
@@ -22,6 +23,7 @@ type Discord struct {
 	lockClient         aws.LockClient
 	registeredCommands []*discordgo.ApplicationCommand
 	config             Config
+	channelIDs         map[string]struct{}
 	zlog               *zerolog.Logger
 }
 
@@ -84,6 +86,9 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 	}
 
 	d.discordClient.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if _, ok := d.channelIDs[i.ChannelID]; !ok {
+			return
+		}
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
 				prompt := getPayloadFromIteraction(i)
@@ -158,8 +163,12 @@ func NewDiscord(
 		config: Config{
 			RemoveCommands: false,
 		},
-		zlog: zlog,
+		channelIDs: make(map[string]struct{}),
+		zlog:       zlog,
 	}
+
+	// Set intent to read message content
+	discordClient.Identify.Intents |= discordgo.IntentsMessageContent
 
 	err = discordClient.Open()
 	if err != nil {
@@ -167,11 +176,42 @@ func NewDiscord(
 		return nil, err
 	}
 
+	// List all channels in the guild
+	channels, err := discordClient.GuildChannels(guildID)
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to get channels")
+		return nil, err
+	}
+
+	// Find the channel named "openai"
+	var openaiChannel *discordgo.Channel = nil
+	for _, channel := range channels {
+		if channel.Name == "openai" {
+			openaiChannel = channel
+			break
+		}
+	}
+	if openaiChannel == nil {
+		zlog.Error().Msg("Failed to find channel named 'openai'")
+		return nil, errors.New("failed to find channel named 'openai'")
+	}
+	discord.channelIDs[openaiChannel.ID] = struct{}{}
+
 	err = discord.setupDiscordCommands(guildID, zlog)
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to setup Discord commands")
 		return nil, err
 	}
+
+	discordClient.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+		if _, ok := discord.channelIDs[m.ChannelID]; !ok {
+			return
+		}
+		if m.Type == discordgo.MessageTypeThreadCreated {
+
+		}
+		zlog.Info().Interface("m", m).Msg("Message created")
+	})
 
 	discordClient.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		zlog.Info().Interface("r", r).Msg("Discord client is now ready")
@@ -292,12 +332,6 @@ func (d *Discord) Close(zlog *zerolog.Logger) error {
 	err := d.discordClient.Close()
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to close Discord client")
-		resultError = multierror.Append(resultError, err)
-	}
-
-	err = d.lockClient.Close()
-	if err != nil {
-		zlog.Error().Err(err).Msg("Failed to close lock client")
 		resultError = multierror.Append(resultError, err)
 	}
 
