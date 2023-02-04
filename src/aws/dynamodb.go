@@ -19,9 +19,10 @@ import (
 )
 
 var (
-	LockNotFoundError        = errors.New("lock not found")
-	LockHeartbeatFailedError = errors.New("failed to heartbeat lock")
-	LockReleaseFailedError   = errors.New("failed to release lock")
+	LockNotFoundError                = errors.New("lock not found")
+	LockHeartbeatFailedError         = errors.New("failed to heartbeat lock")
+	LockReleaseFailedError           = errors.New("failed to release lock")
+	LockConditionalUpdateFailedError = errors.New("failed to update lock due to condition not being met")
 )
 
 type LockCurrentlyUnavailableError struct {
@@ -51,6 +52,8 @@ type DynamoDBLockClient struct {
 func NewDynamoDBClient(region string) (*dynamodb.Client, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(region),
+		config.WithRetryMaxAttempts(3),
+		config.WithDefaultsMode(aws.DefaultsModeAuto),
 	)
 	if err != nil {
 		return nil, err
@@ -97,7 +100,6 @@ func NewDynamoDBLockClient(
 				var wg sync.WaitGroup
 				var errs multierror.Error
 				for _, lockID := range lockIDs {
-					zlog.Debug().Str("id", lockID).Msg("heartbeat lock")
 					wg.Add(1)
 					go func(lockID string) {
 						defer wg.Done()
@@ -113,7 +115,7 @@ func NewDynamoDBLockClient(
 				}
 
 			case <-d.stopBackgroundJobs:
-				zlog.Debug().Msg("stopping background heartbeat job")
+				zlog.Info().Msg("stopping background heartbeat job")
 				return
 			}
 		}
@@ -137,39 +139,47 @@ func (d *DynamoDBLockClient) Acquire(
 	data interface{},
 ) (*Lock, error) {
 	zlog := d.zlog.With().Str("id", id).Logger()
-	zlog.Debug().Msg("acquiring lock")
 	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
 	existingLock, err := d.getLock(ctx, id)
-	zlog.Debug().Interface("existingLock", existingLock).Msg("got existing lock")
 	if err != nil {
-		d.zlog.Error().Err(err).Msg("failed to get lock")
+		zlog.Error().Err(err).Msg("failed to get lock")
 		return nil, err
 	}
 	if existingLock != nil {
-		d.zlog.Debug().Interface("existingLock", existingLock).Msg("lock is already acquired")
+		zlog.Debug().Interface("existingLock", existingLock).Msg("lock is already acquired")
 		if !existingLock.IsExpired(nowMilliseconds) {
-			d.zlog.Debug().Msg("lock is already acquired and not expired")
+			zlog.Debug().Msg("lock is already acquired and not expired")
 			return existingLock, LockCurrentlyUnavailableError{}
 		}
 
-		d.zlog.Debug().Msg("lock is already acquired but expired")
+		zlog.Debug().Msg("lock is already acquired but expired")
 		newLock, err := d.updateExistingLock(ctx, *existingLock, data, nowMilliseconds)
 		if err != nil {
-			d.zlog.Error().Err(err).Msg("failed to update existing lock")
+			// Lock is acquired, expired, and when we tried to get it we got a conditional error, meaning we lost
+			// the lease to someone else. We need to evict the lock from our cache and return an error.
+			if err == LockConditionalUpdateFailedError {
+				zlog.Debug().Msg("lock is already acquired but expired and conditional check failed")
+				d.mu.Lock()
+				delete(d.locks, id)
+				d.mu.Unlock()
+				return nil, LockCurrentlyUnavailableError{}
+			}
+
+			zlog.Error().Err(err).Msg("failed to update existing lock")
 			return nil, err
 		}
 
 		return newLock, nil
 	}
 
-	d.zlog.Debug().Msg("lock is not acquired")
+	zlog.Debug().Msg("lock is not acquired")
 	lock, err := d.putNewLock(ctx, id, data, nowMilliseconds)
 	if err != nil {
-		d.zlog.Error().Err(err).Msg("failed to put new lock")
+		zlog.Error().Err(err).Msg("failed to put new lock")
 		return nil, err
 	}
 
-	d.zlog.Info().Interface("lock", lock).Msg("acquired lock")
+	zlog.Info().Interface("lock", lock).Msg("acquired lock")
 	return lock, nil
 }
 
@@ -186,7 +196,6 @@ func (d *DynamoDBLockClient) Heartbeat(
 		zlog.Debug().Msg("lock is not locally acquired")
 		return LockNotFoundError
 	}
-	zlog.Debug().Interface("existingLock", existingLock).Msg("got existing lock")
 
 	var newData interface{}
 	if maybeNewData != nil {
@@ -199,6 +208,16 @@ func (d *DynamoDBLockClient) Heartbeat(
 	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
 	_, err := d.updateExistingLock(ctx, existingLock, newData, nowMilliseconds)
 	if err != nil {
+		// Lock is acquired, expired, and when we tried to get it we got a conditional error, meaning we lost
+		// the lease to someone else. We need to evict the lock from our cache and return an error.
+		if err == LockConditionalUpdateFailedError {
+			zlog.Debug().Msg("lock is already acquired but expired and conditional check failed")
+			d.mu.Lock()
+			delete(d.locks, id)
+			d.mu.Unlock()
+			return LockCurrentlyUnavailableError{}
+		}
+
 		zlog.Error().Err(err).Msg("failed to update existing lock")
 		resultError = *multierror.Append(&resultError, err, LockHeartbeatFailedError)
 	}
@@ -278,7 +297,6 @@ func (d *DynamoDBLockClient) getLock(
 		zlog.Error().Err(err).Msg("failed to parse shard")
 		return nil, err
 	}
-	zlog.Debug().Int("shard", shard).Msg("got shard")
 
 	ttl, err := strconv.Atoi(resp.Item["TTL"].(*dynamodbtypes.AttributeValueMemberN).Value)
 	if err != nil {
@@ -369,6 +387,14 @@ func (d *DynamoDBLockClient) updateExistingLock(
 		ExpressionAttributeValues: expr.Values(),
 	})
 	if err != nil {
+		// If this is a ConditionalCheckFailedException, then the lock was not updated because the condition was not met.
+		// This is an expected error and means we've lost the lease.
+		var ccfe *dynamodbtypes.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) {
+			zlog.Debug().Err(err).Msg("failed to update lock because condition was not met")
+			return nil, LockConditionalUpdateFailedError
+		}
+
 		zlog.Error().Err(err).Msg("failed to update lock")
 		return nil, err
 	}
@@ -443,6 +469,12 @@ func (d *DynamoDBLockClient) releaseLock(
 	existingLock Lock,
 	zlog *zerolog.Logger,
 ) error {
+	// First release the lock locally. If the remote release fails, the lease will eventually expire and the lock will
+	// be available again.
+	d.mu.Lock()
+	delete(d.locks, existingLock.ID)
+	d.mu.Unlock()
+
 	conditionSameRecordVersionNumber := expression.Name("RecordVersionNumber").Equal(expression.Value(existingLock.RecordVersionNumber))
 	conditionSameOwner := expression.Name("Owner").Equal(expression.Value(d.Config.Owner))
 	condition := conditionSameRecordVersionNumber.And(conditionSameOwner)
@@ -454,54 +486,30 @@ func (d *DynamoDBLockClient) releaseLock(
 		return err
 	}
 
-	nowMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
-	newRecordVersionNumber, err := uuid.NewV7()
-	newLock := NewLock(
-		existingLock.ID,
-		d.Config.Owner,
-		existingLock.LeaseDurationMilliseconds,
-		nowMilliseconds,
-		newRecordVersionNumber.String(),
-		existingLock.Shard,
-		existingLock.TTLEpochSeconds,
-		existingLock.Data,
-	)
-	item, err := lockToDynamoDBAttributeValues(newLock)
-	if err != nil {
-		zlog.Error().Err(err).Msg("failed to convert lock to dynamodb attribute values")
-		return err
-	}
-
-	// Remove the Shard attribute from the item. This will remove it from the GSI.
-	delete(item, "Shard")
-
-	// Put the item back into the table.
-	_, err = d.Client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:                 &d.TableName,
-		Item:                      item,
+	// Delete item from table
+	_, err = d.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &d.TableName,
+		Key: map[string]dynamodbtypes.AttributeValue{
+			"LockID": &dynamodbtypes.AttributeValueMemberS{Value: existingLock.ID},
+		},
 		ConditionExpression:       expr.Condition(),
 		ExpressionAttributeNames:  expr.Names(),
 		ExpressionAttributeValues: expr.Values(),
 	})
 	if err != nil {
-		d.zlog.Error().Err(err).Msg("failed to release lock")
+		zlog.Error().Err(err).Msg("failed to release lock")
 		return err
 	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.locks, existingLock.ID)
 
 	return nil
 }
 
 func (d *DynamoDBLockClient) getLocalLock(id string) (Lock, bool) {
-	d.zlog.Debug().Str("id", id).Msg("getting local lock")
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	lock, ok := d.locks[id]
-	d.zlog.Debug().Str("id", id).Interface("lock", lock).Bool("ok", ok).Msg("got local lock")
+	d.zlog.Debug().Str("id", id).Interface("lock", lock).Bool("ok", ok).Msg("getLocalLock exit")
 	return lock, ok
 }
 

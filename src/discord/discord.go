@@ -8,6 +8,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
+	"sort"
 	"src/aws"
 	"src/openai"
 	"strings"
@@ -24,6 +25,7 @@ type Discord struct {
 	registeredCommands []*discordgo.ApplicationCommand
 	config             Config
 	channelIDs         map[string]struct{}
+	threadIDs          map[string]struct{}
 	zlog               *zerolog.Logger
 }
 
@@ -164,6 +166,7 @@ func NewDiscord(
 			RemoveCommands: false,
 		},
 		channelIDs: make(map[string]struct{}),
+		threadIDs:  make(map[string]struct{}),
 		zlog:       zlog,
 	}
 
@@ -204,13 +207,100 @@ func NewDiscord(
 	}
 
 	discordClient.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		if _, ok := discord.channelIDs[m.ChannelID]; !ok {
+		_, err := lockClient.Acquire(context.Background(), m.Message.ID, "")
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to acquire lock")
 			return
 		}
-		if m.Type == discordgo.MessageTypeThreadCreated {
+		defer func() {
+			if err := lockClient.Release(context.Background(), m.Message.ID); err != nil {
+				zlog.Error().Err(err).Msg("Failed to release lock")
+			}
+		}()
 
+		zlog := zlog.With().Str("channel", m.ChannelID).Str("message", m.ID).Logger()
+
+		err = discord.UpdateThreadIDs(&zlog)
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to update thread IDs")
 		}
-		zlog.Info().Interface("m", m).Msg("Message created")
+
+		_, okThread := discord.threadIDs[m.ChannelID]
+		if !okThread {
+			return
+		}
+
+		// Get all messages in the thread. Use a limit of 100 and use pagination of beforeID and afterID
+		// to get all messages in the thread.
+		messages := make([]*discordgo.Message, 0)
+		beforeID := ""
+		afterID := ""
+		for {
+			result, err := s.ChannelMessages(m.ChannelID, 100, beforeID, afterID, "")
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to get messages")
+				return
+			}
+			messages = append(messages, result...)
+
+			if len(result) < 100 {
+				break
+			}
+
+			beforeID = result[len(result)-1].ID
+		}
+
+		// sort messages by id; since they are snowflakes this will be in chronological order
+		sort.Slice(messages, func(i, j int) bool {
+			return messages[i].ID < messages[j].ID
+		})
+
+		lastMessage := messages[len(messages)-1]
+
+		// If the newest message in the thread is from a bot, we don't need to respond.
+		if lastMessage.Author.Bot {
+			zlog.Info().Msg("Newest message is from a bot, not responding")
+			return
+		}
+
+		// Set a loading reaction on the newest message.
+		err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "🤖")
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to add reaction")
+		}
+
+		// convert messages to []*ChatMessage, call openaiClient.CompleteChat, and send the response to the thread
+		chatMessages := make([]*openai.ChatMessage, 0)
+		for _, message := range messages {
+			fromHuman := !message.Author.Bot
+			chatMessages = append(chatMessages, &openai.ChatMessage{
+				FromHuman: fromHuman,
+				Text:      message.Content,
+			})
+		}
+		response, err := openaiClient.CompleteChat(chatMessages, context.TODO(), &zlog)
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to complete chat")
+			err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to add reaction")
+			}
+			return
+		}
+		_, err = s.ChannelMessageSend(m.ChannelID, response)
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to send message")
+			err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to add reaction")
+			}
+			return
+		}
+
+		err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "✅")
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to add reaction")
+		}
 	})
 
 	discordClient.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
@@ -220,6 +310,25 @@ func NewDiscord(
 	discord.DebugApplicationCommands()
 
 	return &discord, nil
+}
+
+func (d *Discord) UpdateThreadIDs(zlog *zerolog.Logger) error {
+	threads := make([]*discordgo.Channel, 0)
+	for channelID := range d.channelIDs {
+		result, err := d.discordClient.ThreadsActive(channelID)
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to get threads")
+			return err
+		}
+		threads = append(threads, result.Threads...)
+	}
+
+	d.threadIDs = make(map[string]struct{})
+	for _, thread := range threads {
+		d.threadIDs[thread.ID] = struct{}{}
+	}
+
+	return nil
 }
 
 func (d *Discord) deferInteractionReply(s *discordgo.Session, i *discordgo.InteractionCreate) error {
