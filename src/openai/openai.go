@@ -10,6 +10,7 @@ import (
 	gogpt "github.com/sashabaranov/go-gpt3"
 	"go.uber.org/ratelimit"
 	"strings"
+	"time"
 )
 
 var (
@@ -41,11 +42,21 @@ type ChatMessage struct {
 	Text      string
 }
 
+// GetCurrentDate returns the current date e.g. 2023-02-04.
+func GetCurrentDate() string {
+	now := time.Now().Unix()
+	tm := time.Unix(now, 0)
+	return tm.Format("2006-01-02")
+}
+
 func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog *zerolog.Logger) (string, error) {
 	o.limiter.Take()
 	var resultErr error
 	var promptBuilder strings.Builder
 	promptBuilder.WriteString(o.initialPrompt)
+	promptBuilder.WriteString(GetCurrentDate())
+	promptBuilder.WriteString("\n\n")
+
 	for i := 0; i < len(messages); i++ {
 		message := messages[i]
 		if message.FromHuman {
