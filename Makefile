@@ -3,7 +3,8 @@ APP_NAME := openai-discord-bot
 GO_SRCS := $(shell find src -name '*.go')
 TF_SRCS := $(shell find infra -name '*.tf')
 AWS_PROFILE := retail-admin
-AWS_COMMAND := aws-vault exec $(AWS_PROFILE) --region us-west-2 --
+AWS_REGION := us-west-2
+AWS_COMMAND := aws-vault exec $(AWS_PROFILE) --region $(AWS_REGION) --
 
 .PHONY: clean
 
@@ -49,3 +50,9 @@ terraform-apply: terraform-init
 
 terraform-apply-scale-down: terraform-init
 	cd infra && $(AWS_COMMAND) terraform apply -var-file=secret-variables.tfvars -var="scale_down=true"
+
+list-log-groups:
+	$(AWS_COMMAND) cwl-mount --region $(AWS_REGION) list-log-groups
+
+mount-ecs-log-group:
+	$(AWS_COMMAND) ./infra/mount-ecs-log-group.sh

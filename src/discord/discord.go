@@ -3,7 +3,6 @@ package discord
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/hashicorp/go-multierror"
@@ -12,10 +11,38 @@ import (
 	"src/aws"
 	"src/openai"
 	"strings"
+	"sync"
 )
+
+type GuildID string
+type ChannelID string
+type ThreadID string
+
+// IDsMap stores which guildIDs, channelIDs, and threadIDs the bot is listening to. It also uses a RWMutex to protect
+// concurrent access.
+type IDsMap struct {
+	guildIDs     map[GuildID]bool
+	channelIDs   map[ChannelID]bool
+	threadIDs    map[ThreadID]bool
+	sync.RWMutex // protects guildIDs, channelIDs, and threadIDs
+}
+
+func NewIDsMap(guildIDs []GuildID) IDsMap {
+	guildIDsMap := make(map[GuildID]bool)
+	for _, guildID := range guildIDs {
+		guildIDsMap[guildID] = true
+	}
+
+	return IDsMap{
+		guildIDs:   guildIDsMap,
+		channelIDs: make(map[ChannelID]bool),
+		threadIDs:  make(map[ThreadID]bool),
+	}
+}
 
 type Config struct {
 	RemoveCommands bool
+	ChannelPrefix  string
 }
 
 type Discord struct {
@@ -24,8 +51,7 @@ type Discord struct {
 	lockClient         aws.LockClient
 	registeredCommands []*discordgo.ApplicationCommand
 	config             Config
-	channelIDs         map[string]struct{}
-	threadIDs          map[string]struct{}
+	idsMap             IDsMap
 	zlog               *zerolog.Logger
 }
 
@@ -87,10 +113,28 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 		commandHandlers[discordCommand.Name] = discordCommand.Handler
 	}
 
+	// Handle channel creation or deletion
+	d.discordClient.AddHandler(func(s *discordgo.Session, c *discordgo.ChannelCreate) {
+		err := d.updateChannels()
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to update channels")
+		}
+	})
+
+	d.discordClient.AddHandler(func(s *discordgo.Session, c *discordgo.ChannelDelete) {
+		err := d.updateChannels()
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to update channels")
+		}
+	})
+
 	d.discordClient.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		if _, ok := d.channelIDs[i.ChannelID]; !ok {
+		d.idsMap.RLock()
+		if _, ok := d.idsMap.channelIDs[ChannelID(i.ChannelID)]; !ok {
 			return
 		}
+		d.idsMap.RUnlock()
+
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
 				prompt := getPayloadFromIteraction(i)
@@ -145,6 +189,33 @@ func (d *Discord) DebugApplicationCommands() {
 	}
 }
 
+func (d *Discord) updateChannels() error {
+	d.idsMap.Lock()
+	defer d.idsMap.Unlock()
+
+	newChannelIDs := make(map[ChannelID]bool)
+	for guildID := range d.idsMap.guildIDs {
+		channels, err := d.discordClient.GuildChannels(string(guildID))
+		if err != nil {
+			d.zlog.Error().Err(err).Msg("Failed to get channels")
+			return err
+		}
+
+		// Find channels prefixed with the channel prefix
+		for _, channel := range channels {
+			if strings.HasPrefix(channel.Name, d.config.ChannelPrefix) {
+				d.zlog.Info().Str("channel", channel.Name).Str("id", channel.ID).Msg("Found channel")
+				newChannelIDs[ChannelID(channel.ID)] = true
+			}
+		}
+	}
+
+	d.idsMap.channelIDs = newChannelIDs
+	d.zlog.Info().Interface("channelIDs", newChannelIDs).Msg("Updated channel IDs")
+
+	return nil
+}
+
 func NewDiscord(
 	discordToken string,
 	openaiClient *openai.OpenAI,
@@ -164,10 +235,10 @@ func NewDiscord(
 		lockClient:    lockClient,
 		config: Config{
 			RemoveCommands: false,
+			ChannelPrefix:  "openai",
 		},
-		channelIDs: make(map[string]struct{}),
-		threadIDs:  make(map[string]struct{}),
-		zlog:       zlog,
+		idsMap: NewIDsMap([]GuildID{GuildID(guildID)}),
+		zlog:   zlog,
 	}
 
 	// Set intent to read message content
@@ -179,26 +250,17 @@ func NewDiscord(
 		return nil, err
 	}
 
-	// List all channels in the guild
-	channels, err := discordClient.GuildChannels(guildID)
+	err = discord.updateChannels()
 	if err != nil {
-		zlog.Error().Err(err).Msg("Failed to get channels")
+		zlog.Error().Err(err).Msg("Failed to update channels")
 		return nil, err
 	}
 
-	// Find the channel named "openai"
-	var openaiChannel *discordgo.Channel = nil
-	for _, channel := range channels {
-		if channel.Name == "openai" {
-			openaiChannel = channel
-			break
-		}
+	err = discord.updateThreads(zlog)
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to update threads")
+		return nil, err
 	}
-	if openaiChannel == nil {
-		zlog.Error().Msg("Failed to find channel named 'openai'")
-		return nil, errors.New("failed to find channel named 'openai'")
-	}
-	discord.channelIDs[openaiChannel.ID] = struct{}{}
 
 	err = discord.setupDiscordCommands(guildID, zlog)
 	if err != nil {
@@ -220,13 +282,21 @@ func NewDiscord(
 
 		zlog := zlog.With().Str("channel", m.ChannelID).Str("message", m.ID).Logger()
 
-		err = discord.UpdateThreadIDs(&zlog)
+		err = discord.updateThreads(&zlog)
 		if err != nil {
 			zlog.Error().Err(err).Msg("Failed to update thread IDs")
 		}
 
-		_, okThread := discord.threadIDs[m.ChannelID]
-		if !okThread {
+		if unknownThread := func(threadID ThreadID) bool {
+			discord.idsMap.RLock()
+			defer discord.idsMap.RUnlock()
+
+			if _, okThread := discord.idsMap.threadIDs[threadID]; !okThread {
+				return true
+			}
+			return false
+
+		}(ThreadID(m.ChannelID)); unknownThread {
 			return
 		}
 
@@ -312,21 +382,24 @@ func NewDiscord(
 	return &discord, nil
 }
 
-func (d *Discord) UpdateThreadIDs(zlog *zerolog.Logger) error {
-	threads := make([]*discordgo.Channel, 0)
-	for channelID := range d.channelIDs {
-		result, err := d.discordClient.ThreadsActive(channelID)
+func (d *Discord) updateThreads(zlog *zerolog.Logger) error {
+	d.idsMap.Lock()
+	defer d.idsMap.Unlock()
+
+	newThreadIDs := make(map[ThreadID]bool)
+
+	for channelID := range d.idsMap.channelIDs {
+		result, err := d.discordClient.ThreadsActive(string(channelID))
 		if err != nil {
 			zlog.Error().Err(err).Msg("Failed to get threads")
 			return err
 		}
-		threads = append(threads, result.Threads...)
+		for _, thread := range result.Threads {
+			newThreadIDs[ThreadID(thread.ID)] = true
+		}
 	}
 
-	d.threadIDs = make(map[string]struct{})
-	for _, thread := range threads {
-		d.threadIDs[thread.ID] = struct{}{}
-	}
+	d.idsMap.threadIDs = newThreadIDs
 
 	return nil
 }

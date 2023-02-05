@@ -432,3 +432,8 @@ resource "aws_ecs_cluster_capacity_providers" "ecs_cluster_capacity_providers" {
 output "ecr_repository_url" {
   value = aws_ecr_repository.ecr_repo.repository_url
 }
+
+
+output "ecs_log_group" {
+    value = aws_cloudwatch_log_group.log_group.name
+}
