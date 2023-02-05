@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+const (
+	HumanPrefix = "Human: "
+	BotPrefix   = "Assistant: "
+)
+
 var (
 	FailedToCompletePrompt = errors.New("failed to complete prompt")
 
@@ -60,9 +65,10 @@ func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog
 	for i := 0; i < len(messages); i++ {
 		message := messages[i]
 		if message.FromHuman {
-			promptBuilder.WriteString("Human: ")
+			promptBuilder.WriteString(HumanPrefix)
 		} else {
-			promptBuilder.WriteString("Assistant: ")
+			promptBuilder.WriteString(BotPrefix)
+			promptBuilder.WriteString(" ")
 		}
 		promptBuilder.WriteString(message.Text)
 		if i != len(messages)-1 {
@@ -84,8 +90,8 @@ func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog
 	botLines := make([]string, 0)
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
-		if strings.HasPrefix(line, "Assistant:") {
-			line = strings.TrimPrefix(line, "Assistant:")
+		if strings.HasPrefix(line, BotPrefix) {
+			line = strings.TrimPrefix(line, BotPrefix)
 			botLines = append(botLines, line)
 			break
 		}
