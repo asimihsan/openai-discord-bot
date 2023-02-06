@@ -330,17 +330,6 @@ resource "aws_launch_template" "launch_template" {
   iam_instance_profile {
     arn = aws_iam_instance_profile.ecs_instance_role.arn
   }
-  instance_type = "t4g.nano"
-
-  instance_market_options {
-    market_type = "spot"
-  }
-
-  ebs_optimized = true
-
-  monitoring {
-    enabled = false
-  }
 
   network_interfaces {
     delete_on_termination       = true
@@ -357,23 +346,55 @@ resource "aws_launch_template" "launch_template" {
     })
   )
 
+  lifecycle {
+    create_before_destroy = true
+  }
+
   tags = merge(local.tags, {
   })
 }
 
 resource "aws_autoscaling_group" "asg" {
   name                      = "${var.application}-${local.environment}-${random_id.application.hex}"
-  max_size                  = 4
+  max_size                  = var.scale_down ? 0 : 4
   min_size                  = var.scale_down ? 0 : 1
   desired_capacity          = var.scale_down ? 0 : 2
-  health_check_grace_period = 300
+  health_check_grace_period = 120
   health_check_type         = "EC2"
   force_delete              = true
   vpc_zone_identifier       = aws_subnet.public_subnet.*.id
+  protect_from_scale_in     = true
 
-  launch_template {
-    id      = aws_launch_template.launch_template.id
-    version = aws_launch_template.launch_template.latest_version
+  // https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-capacity-rebalancing.html
+  capacity_rebalance        = true
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = 0
+      on_demand_percentage_above_base_capacity = 0
+
+      // https://aws.amazon.com/blogs/compute/introducing-price-capacity-optimized-allocation-strategy-for-ec2-spot-instances/
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.launch_template.id
+        version            = aws_launch_template.launch_template.latest_version
+      }
+
+      override {
+        instance_type = "t4g.nano"
+        weighted_capacity = 1
+      }
+
+      // t4g.small are free 750 hours per month until Dec/31/2023
+      // See: https://aws.amazon.com/ec2/faqs/#t4g-instances
+      override {
+        instance_type = "t4g.small"
+        weighted_capacity = 1
+      }      
+    }
   }
 
   lifecycle {
@@ -410,7 +431,7 @@ resource "aws_ecs_capacity_provider" "ecs_cluster_provider" {
       target_capacity = 100
       minimum_scaling_step_size = 1
       maximum_scaling_step_size = 10000
-      instance_warmup_period = 300
+      instance_warmup_period = 120
     }
   }
 
