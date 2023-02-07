@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog"
 	gogpt "github.com/sashabaranov/go-gpt3"
 	"go.uber.org/ratelimit"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -166,4 +167,42 @@ func (o *OpenAI) CreateImage(prompt string, ctx context.Context, zlog *zerolog.L
 func (o *OpenAI) Close(*zerolog.Logger) error {
 	o.client.HTTPClient.CloseIdleConnections()
 	return nil
+}
+
+func (o *OpenAI) Summarize(
+	content string,
+	words int,
+	ctx context.Context,
+	zlog *zerolog.Logger,
+) (string, error) {
+	o.limiter.Take()
+
+	var promptBuilder strings.Builder
+	promptBuilder.WriteString(o.initialPrompt)
+	promptBuilder.WriteString(GetCurrentDate())
+	promptBuilder.WriteString("\n\n")
+	promptBuilder.WriteString("Summarize the following message into less than ")
+	promptBuilder.WriteString(strconv.Itoa(words))
+	promptBuilder.WriteString(" words:\n\n")
+	promptBuilder.WriteString(content)
+	prompt := promptBuilder.String()
+
+	completion, err := o.client.CreateCompletion(ctx, gogpt.CompletionRequest{
+		Model:     gogpt.GPT3TextDavinci003,
+		MaxTokens: 64,
+		Prompt:    prompt,
+		Stop:      []string{"<|endoftext|>"},
+	})
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to complete prompt")
+		return "", err
+	}
+
+	// trim space from summary
+	summary := strings.TrimSpace(completion.Choices[0].Text)
+
+	// trim punctuation from summary
+	summary = strings.TrimRight(summary, ".")
+
+	return summary, err
 }

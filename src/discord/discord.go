@@ -282,6 +282,48 @@ func NewDiscord(
 
 		zlog := zlog.With().Str("channel", m.ChannelID).Str("message", m.ID).Logger()
 
+		// If the message is in a channel and it is not creating a thread, use it to create a thread.
+		var maybeNewThread *discordgo.Channel = nil
+		if shouldCreateThread := func() bool {
+			discord.idsMap.RLock()
+			defer discord.idsMap.RUnlock()
+
+			if _, ok := discord.idsMap.channelIDs[ChannelID(m.ChannelID)]; !ok {
+				return false
+			}
+
+			if m.Message.Flags&discordgo.MessageFlagsHasThread != 0 {
+				return false
+			}
+
+			return true
+		}(); shouldCreateThread {
+			// Use OpenAI to summarize the message into a short title with less than 4 words.
+			summary, err := discord.openaiClient.Summarize(m.Message.Content, 4, context.TODO(), &zlog)
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to summarize message")
+				return
+			}
+			zlog.Info().Str("summary", summary).Msg("Summarized message")
+
+			// See: https://github.com/bwmarrin/discordgo/blob/master/examples/threads/main.go
+			maybeNewThread, err = s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
+				Name:                summary,
+				AutoArchiveDuration: 1440, /* 1 day */
+				Invitable:           false,
+				RateLimitPerUser:    1,
+			})
+
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to create thread")
+				return
+			}
+
+			zlog.Debug().Str("thread", maybeNewThread.ID).Msg("Created thread")
+
+			return
+		}
+
 		err = discord.updateThreads(&zlog)
 		if err != nil {
 			zlog.Error().Err(err).Msg("Failed to update thread IDs")
@@ -305,13 +347,29 @@ func NewDiscord(
 		messages := make([]*discordgo.Message, 0)
 		beforeID := ""
 		afterID := ""
+
+		var channelID string
+		if maybeNewThread != nil {
+			channelID = maybeNewThread.ID
+		} else {
+			channelID = m.ChannelID
+		}
+		zlog.Debug().Str("channel", channelID).Msg("Getting messages")
+
 		for {
-			result, err := s.ChannelMessages(m.ChannelID, 100, beforeID, afterID, "")
+			result, err := s.ChannelMessages(channelID, 100, beforeID, afterID, "")
 			if err != nil {
 				zlog.Error().Err(err).Msg("Failed to get messages")
 				return
 			}
-			messages = append(messages, result...)
+
+			// only append messages that have non-empty content
+			for _, message := range result {
+				if message.Content == "" {
+					continue
+				}
+				messages = append(messages, message)
+			}
 
 			if len(result) < 100 {
 				break
@@ -325,7 +383,29 @@ func NewDiscord(
 			return messages[i].ID < messages[j].ID
 		})
 
+		// If a starter message exists, Discord re-uses the same ID for both this starter message and the thread itself.
+		// Hence, listing messages in a thread cannot return the first message (!!!). You have to get the parent of the
+		// thread, list messages in the thread, and find the message with the same ID at the thread (!!!).
+		starterMessage, err := discord.FetchStarterMessage(m.ChannelID, &zlog)
+		if err == nil {
+			zlog.Info().
+				Str("starter_message", starterMessage.ID).
+				Str("author", starterMessage.Author.ID).
+				Str("content", starterMessage.Content).
+				Msg("Starter message")
+			messages = append([]*discordgo.Message{starterMessage}, messages...)
+		}
+
+		for _, message := range messages {
+			zlog.Info().Str("sub_message", message.ID).Str("author", message.Author.ID).Str("content", m.Content).Msg("Message")
+		}
+
 		lastMessage := messages[len(messages)-1]
+
+		// If there is only one message, assume this is from a human.
+		if len(messages) == 1 {
+			messages[0].Author.Bot = false
+		}
 
 		// If the newest message in the thread is from a bot, we don't need to respond.
 		if lastMessage.Author.Bot {
@@ -380,6 +460,23 @@ func NewDiscord(
 	discord.DebugApplicationCommands()
 
 	return &discord, nil
+}
+
+// see: https://github.com/discordjs/discord.js/blob/f3fe3ced622676b406a62b43f085aedde7a621aa/packages/discord.js/src/structures/ThreadChannel.js#L303-L315
+func (d *Discord) FetchStarterMessage(threadID string, zlog *zerolog.Logger) (*discordgo.Message, error) {
+	channel, err := d.discordClient.Channel(threadID)
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to get thread")
+		return nil, err
+	}
+
+	// Get the message whose ID is the same as the thread ID.
+	message, err := d.discordClient.ChannelMessage(channel.ParentID, threadID)
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to get parent message")
+		return nil, err
+	}
+	return message, nil
 }
 
 func (d *Discord) updateThreads(zlog *zerolog.Logger) error {
