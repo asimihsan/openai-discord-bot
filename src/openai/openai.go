@@ -116,10 +116,10 @@ func (o *OpenAI) Complete(prompt string, ctx context.Context, zlog *zerolog.Logg
 	var resultErr error
 	completion, err := o.client.CreateCompletion(ctx, gogpt.CompletionRequest{
 		Model:       gogpt.GPT3TextDavinci003,
-		MaxTokens:   512,
+		MaxTokens:   2048,
 		Prompt:      prompt,
-		Temperature: 1.0,
-		TopP:        0.9,
+		Temperature: 0.0,
+		TopP:        1.0,
 		Stop:        []string{"<|endoftext|>"},
 	})
 	if err != nil {
