@@ -363,7 +363,7 @@ resource "aws_autoscaling_group" "asg" {
   health_check_type         = "EC2"
   force_delete              = true
   vpc_zone_identifier       = aws_subnet.public_subnet.*.id
-  protect_from_scale_in     = true
+  protect_from_scale_in     = false
 
   // https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-capacity-rebalancing.html
   capacity_rebalance        = true
