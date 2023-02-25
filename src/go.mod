@@ -10,7 +10,6 @@ require (
 	github.com/bwmarrin/discordgo v0.27.0
 	github.com/gofrs/uuid v4.4.0+incompatible
 	github.com/hashicorp/go-multierror v1.1.1
-	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/rs/zerolog v1.29.0
 	github.com/sashabaranov/go-gpt3 v0.0.0-20230112080207-81b5788cd68e
 	go.uber.org/ratelimit v0.2.0
@@ -39,5 +38,5 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.0.0-20210421170649-83a5a9bb288b // indirect
-	golang.org/x/sys v0.0.0-20210927094055-39ccf1dd6fa6 // indirect
+	golang.org/x/sys v0.1.0 // indirect
 )
