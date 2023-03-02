@@ -91,7 +91,7 @@ func (o *OpenAI) ChatComplete(
 	completion, err := o.client.CreateChatCompletion(ctx, gogpt.ChatCompletionRequest{
 		Model:       gogpt.GPT3Dot5Turbo,
 		Messages:    messages,
-		MaxTokens:   2048,
+		MaxTokens:   4096,
 		Temperature: 0.0,
 		TopP:        1.0,
 		Stream:      false,
