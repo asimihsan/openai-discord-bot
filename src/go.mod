@@ -11,11 +11,9 @@ require (
 	github.com/gofrs/uuid v4.4.0+incompatible
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/rs/zerolog v1.29.0
-	github.com/sashabaranov/go-gpt3 v0.0.0-20230112080207-81b5788cd68e
+	github.com/sashabaranov/go-gpt3 v1.3.1
 	go.uber.org/ratelimit v0.2.0
 )
-
-replace github.com/sashabaranov/go-gpt3 => github.com/NICEXAI/go-gpt3 v0.0.0-20230302140648-e953809b29e8
 
 require (
 	github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 // indirect
