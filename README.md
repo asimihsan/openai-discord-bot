@@ -13,3 +13,7 @@ A Discord bot that uses OpenAI's GPT-3 API to generate text, generate images and
 - [ ] Text completion shouldn't use interactions, so that inputs can be free-form.
 - [ ] Add a command to have a conversation with the bot. Will have it in a new thread.
 - [ ] If instance fails while holding the lock, another instance will get the lock and respond.
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0. See the [LICENSE](LICENSE) file for details.
