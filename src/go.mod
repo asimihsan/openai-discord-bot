@@ -15,6 +15,8 @@ require (
 	go.uber.org/ratelimit v0.2.0
 )
 
+replace github.com/sashabaranov/go-gpt3 => github.com/NICEXAI/go-gpt3 v0.0.0-20230302140648-e953809b29e8
+
 require (
 	github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.13.10 // indirect

@@ -5,18 +5,13 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"errors"
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
 	gogpt "github.com/sashabaranov/go-gpt3"
 	"go.uber.org/ratelimit"
 	"strconv"
 	"strings"
 	"time"
-)
-
-const (
-	HumanPrefix = "Human: "
-	BotPrefix   = "Assistant: "
 )
 
 var (
@@ -58,57 +53,56 @@ func GetCurrentDate() string {
 func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog *zerolog.Logger) (string, error) {
 	o.limiter.Take()
 	var resultErr error
-	var promptBuilder strings.Builder
-	promptBuilder.WriteString(o.initialPrompt)
-	promptBuilder.WriteString(GetCurrentDate())
-	promptBuilder.WriteString("\n\n")
+	requestMessages := make([]gogpt.ChatCompletionMessage, 0, len(messages))
 
 	for i := 0; i < len(messages); i++ {
 		message := messages[i]
 		if message.FromHuman {
-			promptBuilder.WriteString(HumanPrefix)
+			requestMessages = append(requestMessages, gogpt.ChatCompletionMessage{
+				Role:    "user",
+				Content: message.Text,
+			})
 		} else {
-			promptBuilder.WriteString(BotPrefix)
-			promptBuilder.WriteString(" ")
-		}
-		promptBuilder.WriteString(message.Text)
-		if i != len(messages)-1 {
-			promptBuilder.WriteString("\n\n")
+			requestMessages = append(requestMessages, gogpt.ChatCompletionMessage{
+				Role:    "assistant",
+				Content: message.Text,
+			})
 		}
 	}
-	promptBuilder.WriteString(" <|endoftext|> ")
 
-	// use Complete to get the bot's response
-	completion, err := o.Complete(promptBuilder.String(), ctx, zlog)
+	completion, err := o.ChatComplete(requestMessages, ctx, zlog)
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to complete prompt")
 		resultErr = multierror.Append(resultErr, err)
 		return "", resultErr
 	}
-	zlog.Debug().Str("prompt", promptBuilder.String()).Msgf("completion: %s", completion)
+	zlog.Debug().Interface("requestMessages", requestMessages).Msgf("completion: %s", completion)
 
-	lines := strings.Split(completion, "\n")
-	botLines := make([]string, 0)
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		if strings.HasPrefix(line, BotPrefix) {
-			line = strings.TrimPrefix(line, BotPrefix)
-			botLines = append(botLines, line)
-			break
-		}
-		botLines = append(botLines, line)
+	return completion, nil
+}
+
+func (o *OpenAI) ChatComplete(
+	messages []gogpt.ChatCompletionMessage,
+	ctx context.Context,
+	zlog *zerolog.Logger,
+) (string, error) {
+	o.limiter.Take()
+	var resultErr error
+	completion, err := o.client.CreateChatCompletion(ctx, gogpt.ChatCompletionRequest{
+		Model:       gogpt.GPT3Dot5Turbo,
+		Messages:    messages,
+		MaxTokens:   2048,
+		Temperature: 0.0,
+		TopP:        1.0,
+		Stream:      false,
+		Stop:        []string{"<|endoftext|>"},
+	})
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to complete chat")
+		resultErr = multierror.Append(resultErr, err, FailedToCompletePrompt)
+		return "", resultErr
 	}
-
-	// join botLines in reverse order
-	var botResponseBuilder strings.Builder
-	for i := len(botLines) - 1; i >= 0; i-- {
-		botResponseBuilder.WriteString(botLines[i])
-		if i != 0 {
-			botResponseBuilder.WriteString("\n")
-		}
-	}
-
-	return botResponseBuilder.String(), nil
+	return completion.Choices[0].Message.Content, resultErr
 }
 
 func (o *OpenAI) Complete(prompt string, ctx context.Context, zlog *zerolog.Logger) (string, error) {
@@ -165,7 +159,7 @@ func (o *OpenAI) CreateImage(prompt string, ctx context.Context, zlog *zerolog.L
 }
 
 func (o *OpenAI) Close(*zerolog.Logger) error {
-	o.client.HTTPClient.CloseIdleConnections()
+	//o.client.HTTPClient.CloseIdleConnections()
 	return nil
 }
 
