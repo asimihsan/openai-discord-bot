@@ -153,8 +153,11 @@ func (d *Discord) setupDiscordCommands(guildID string, zlog *zerolog.Logger) err
 
 		if i.Type == discordgo.InteractionApplicationCommand {
 			if handler, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
-				prompt := getPayloadFromIteraction(i)
-				lock, err := d.lockClient.Acquire(context.Background(), i.ID, prompt)
+
+				// TODO track prompts in S3 for resumption
+				getPayloadFromIteraction(i)
+				lock, err := d.lockClient.Acquire(context.Background(), i.ID, "" /*data*/)
+
 				if err != nil {
 					zlog.Error().Err(err).Msg("Failed to acquire lock")
 					return

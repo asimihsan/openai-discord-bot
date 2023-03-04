@@ -28,6 +28,7 @@ type Lock struct {
 	RecordVersionNumber         string
 	Shard                       int64
 	TTLEpochSeconds             int64
+	CreatedAtMilliseconds       int64
 	Data                        interface{}
 }
 
@@ -51,6 +52,7 @@ func NewLock(
 	RecordVersionNumber string,
 	Shard int64,
 	TTLEpochSeconds int64,
+	CreatedAtMilliseconds int64,
 	Data interface{},
 ) Lock {
 	return Lock{
@@ -61,6 +63,7 @@ func NewLock(
 		RecordVersionNumber:         RecordVersionNumber,
 		Shard:                       Shard,
 		TTLEpochSeconds:             TTLEpochSeconds,
+		CreatedAtMilliseconds:       CreatedAtMilliseconds,
 		Data:                        Data,
 	}
 }

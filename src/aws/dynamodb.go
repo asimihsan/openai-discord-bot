@@ -39,6 +39,7 @@ var (
 	LockHeartbeatFailedError         = errors.New("failed to heartbeat lock")
 	LockReleaseFailedError           = errors.New("failed to release lock")
 	LockConditionalUpdateFailedError = errors.New("failed to update lock due to condition not being met")
+	LockAbandonedError               = errors.New("lock abandoned")
 )
 
 type LockCurrentlyUnavailableError struct {
@@ -213,6 +214,12 @@ func (d *DynamoDBLockClient) Heartbeat(
 		return LockNotFoundError
 	}
 
+	// if the existing lock was created more than 1 minute ago, then just leave it alone
+	if existingLock.CreatedAtMilliseconds < time.Now().UnixNano()/int64(time.Millisecond)-60000 {
+		zlog.Debug().Msg("lock is more than 1 minute old, abandoning it")
+		return LockAbandonedError
+	}
+
 	var newData interface{}
 	if maybeNewData != nil {
 		newData = *maybeNewData
@@ -321,6 +328,12 @@ func (d *DynamoDBLockClient) getLock(
 	}
 	zlog.Debug().Int("ttl", ttl).Msg("got TTL")
 
+	createdAtMilliseconds, err := strconv.Atoi(resp.Item["CreatedAtMilliseconds"].(*dynamodbtypes.AttributeValueMemberN).Value)
+	if err != nil {
+		zlog.Error().Err(err).Msg("failed to parse createdAt")
+		return nil, err
+	}
+
 	dataSerialized := resp.Item["Data"].(*dynamodbtypes.AttributeValueMemberB).Value
 	zlog.Debug().Str("dataSerialized", string(dataSerialized)).Msg("got data")
 
@@ -340,6 +353,7 @@ func (d *DynamoDBLockClient) getLock(
 		recordVersionNumber,
 		int64(shard),
 		int64(ttl),
+		int64(createdAtMilliseconds),
 		data,
 	))
 	zlog.Debug().Interface("lock", newLock).Msg("returning new lock")
@@ -374,6 +388,7 @@ func (d *DynamoDBLockClient) updateExistingLock(
 		newRecordVersionNumber.String(),
 		existingLock.Shard,
 		newTtl,
+		existingLock.CreatedAtMilliseconds,
 		newData,
 	)
 	item, err := lockToDynamoDBAttributeValues(newLock)
@@ -445,6 +460,7 @@ func (d *DynamoDBLockClient) putNewLock(
 		recordVersionNumber.String(),
 		int64(shard),
 		ttl,
+		nowMilliseconds,
 		data,
 	)
 	item, err := lockToDynamoDBAttributeValues(lock)
