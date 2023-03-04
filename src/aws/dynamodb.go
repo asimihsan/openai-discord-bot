@@ -122,6 +122,12 @@ func NewDynamoDBLockClient(
 						defer wg.Done()
 						err := d.Heartbeat(context.TODO(), lockID, nil)
 						if err != nil {
+							// if we are abandoning a lock, remove it from the map
+							if errors.Is(err, LockAbandonedError) {
+								d.mu.Lock()
+								delete(d.locks, lockID)
+								d.mu.Unlock()
+							}
 							errs.Errors = append(errs.Errors, err)
 						}
 					}(lockID)
