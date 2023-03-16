@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.20.1-bullseye AS builder
+FROM golang:1.20.2-bullseye AS builder
 
 RUN \
     --mount=type=cache,target=/var/cache/apt \

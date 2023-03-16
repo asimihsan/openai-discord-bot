@@ -11,7 +11,7 @@ require (
 	github.com/gofrs/uuid v4.4.0+incompatible
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/rs/zerolog v1.29.0
-	github.com/sashabaranov/go-gpt3 v1.3.1
+	github.com/sashabaranov/go-openai v1.5.2
 	go.uber.org/ratelimit v0.2.0
 )
 

@@ -220,8 +220,9 @@ func (d *DynamoDBLockClient) Heartbeat(
 		return LockNotFoundError
 	}
 
-	// if the existing lock was created more than 1 minute ago, then just leave it alone
-	if existingLock.CreatedAtMilliseconds < time.Now().UnixNano()/int64(time.Millisecond)-60000 {
+	// if the existing lock was created more than 5 minutes ago, then just leave it alone
+	const abandonLockAfterMilliseconds = 5 * 60 * 1000
+	if existingLock.CreatedAtMilliseconds < time.Now().UnixNano()/int64(time.Millisecond)-abandonLockAfterMilliseconds {
 		zlog.Debug().Msg("lock is more than 1 minute old, abandoning it")
 		return LockAbandonedError
 	}
@@ -583,6 +584,9 @@ func lockToDynamoDBAttributeValues(lock Lock) (map[string]dynamodbtypes.Attribut
 		},
 		"TTL": &dynamodbtypes.AttributeValueMemberN{
 			Value: strconv.Itoa(int(lock.TTLEpochSeconds)),
+		},
+		"CreatedAtMilliseconds": &dynamodbtypes.AttributeValueMemberN{
+			Value: strconv.Itoa(int(lock.CreatedAtMilliseconds)),
 		},
 	}, nil
 }

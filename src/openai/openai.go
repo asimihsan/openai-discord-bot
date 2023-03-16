@@ -23,7 +23,7 @@ import (
 	"errors"
 	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
-	gogpt "github.com/sashabaranov/go-gpt3"
+	goopenai "github.com/sashabaranov/go-openai"
 	"go.uber.org/ratelimit"
 	"strconv"
 	"strings"
@@ -38,13 +38,13 @@ var (
 )
 
 type OpenAI struct {
-	client        *gogpt.Client
+	client        *goopenai.Client
 	initialPrompt string
 	limiter       ratelimit.Limiter
 }
 
 func NewOpenAI(token string) *OpenAI {
-	client := gogpt.NewClient(token)
+	client := goopenai.NewClient(token)
 	limiter := ratelimit.New(1)
 
 	return &OpenAI{
@@ -69,17 +69,17 @@ func GetCurrentDate() string {
 func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog *zerolog.Logger) (string, error) {
 	o.limiter.Take()
 	var resultErr error
-	requestMessages := make([]gogpt.ChatCompletionMessage, 0, len(messages))
+	requestMessages := make([]goopenai.ChatCompletionMessage, 0, len(messages))
 
 	for i := 0; i < len(messages); i++ {
 		message := messages[i]
 		if message.FromHuman {
-			requestMessages = append(requestMessages, gogpt.ChatCompletionMessage{
+			requestMessages = append(requestMessages, goopenai.ChatCompletionMessage{
 				Role:    "user",
 				Content: message.Text,
 			})
 		} else {
-			requestMessages = append(requestMessages, gogpt.ChatCompletionMessage{
+			requestMessages = append(requestMessages, goopenai.ChatCompletionMessage{
 				Role:    "assistant",
 				Content: message.Text,
 			})
@@ -98,16 +98,16 @@ func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog
 }
 
 func (o *OpenAI) ChatComplete(
-	messages []gogpt.ChatCompletionMessage,
+	messages []goopenai.ChatCompletionMessage,
 	ctx context.Context,
 	zlog *zerolog.Logger,
 ) (string, error) {
 	o.limiter.Take()
 	var resultErr error
-	completion, err := o.client.CreateChatCompletion(ctx, gogpt.ChatCompletionRequest{
-		Model:       gogpt.GPT3Dot5Turbo,
+	completion, err := o.client.CreateChatCompletion(ctx, goopenai.ChatCompletionRequest{
+		Model:       goopenai.GPT4,
 		Messages:    messages,
-		MaxTokens:   2048,
+		MaxTokens:   4096,
 		Temperature: 0.0,
 		TopP:        1.0,
 		Stream:      false,
@@ -124,8 +124,8 @@ func (o *OpenAI) ChatComplete(
 func (o *OpenAI) Complete(prompt string, ctx context.Context, zlog *zerolog.Logger) (string, error) {
 	o.limiter.Take()
 	var resultErr error
-	completion, err := o.client.CreateCompletion(ctx, gogpt.CompletionRequest{
-		Model:       gogpt.GPT3TextDavinci003,
+	completion, err := o.client.CreateCompletion(ctx, goopenai.CompletionRequest{
+		Model:       goopenai.GPT3TextDavinci003,
 		MaxTokens:   2048,
 		Prompt:      prompt,
 		Temperature: 0.0,
@@ -150,11 +150,11 @@ type Image struct {
 
 func (o *OpenAI) CreateImage(prompt string, ctx context.Context, zlog *zerolog.Logger) (*CreateImageResponse, error) {
 	o.limiter.Take()
-	resp, err := o.client.CreateImage(ctx, gogpt.ImageRequest{
+	resp, err := o.client.CreateImage(ctx, goopenai.ImageRequest{
 		Prompt:         prompt,
 		N:              1,
-		Size:           gogpt.CreateImageSize1024x1024,
-		ResponseFormat: gogpt.CreateImageResponseFormatB64JSON,
+		Size:           goopenai.CreateImageSize1024x1024,
+		ResponseFormat: goopenai.CreateImageResponseFormatB64JSON,
 	})
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to create image")
@@ -197,8 +197,8 @@ func (o *OpenAI) Summarize(
 	promptBuilder.WriteString(content)
 	prompt := promptBuilder.String()
 
-	completion, err := o.client.CreateCompletion(ctx, gogpt.CompletionRequest{
-		Model:     gogpt.GPT3TextDavinci003,
+	completion, err := o.client.CreateCompletion(ctx, goopenai.CompletionRequest{
+		Model:     goopenai.GPT3TextDavinci003,
 		MaxTokens: 64,
 		Prompt:    prompt,
 		Stop:      []string{"<|endoftext|>"},
