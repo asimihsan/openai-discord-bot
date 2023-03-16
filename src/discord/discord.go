@@ -456,14 +456,44 @@ func NewDiscord(
 			}
 			return
 		}
-		_, err = s.ChannelMessageSend(m.ChannelID, response)
-		if err != nil {
-			zlog.Error().Err(err).Msg("Failed to send message")
-			err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
-			if err != nil {
-				zlog.Error().Err(err).Msg("Failed to add reaction")
+
+		// split the message on full stops ("."). Send the message in 2000 character chunks, so join the chunks
+		// until the length of the message is less than 2000 characters.
+		responseChunks := make([]string, 0)
+		currentSize := 0
+		for _, chunk := range strings.Split(response, ".") {
+			if len(chunk) == 0 {
+				continue
 			}
-			return
+			if currentSize+len(chunk) > 2000 {
+				response := strings.Join(responseChunks, ".")
+				_, err = s.ChannelMessageSend(m.ChannelID, response)
+				if err != nil {
+					zlog.Error().Err(err).Msg("Failed to send message")
+					err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+					if err != nil {
+						zlog.Error().Err(err).Msg("Failed to add reaction")
+					}
+					return
+				}
+				responseChunks = []string{chunk}
+				currentSize = len(chunk)
+				continue
+			}
+			responseChunks = append(responseChunks, chunk)
+			currentSize += len(chunk)
+		}
+		response = strings.Join(responseChunks, ".")
+		if len(response) > 0 {
+			_, err = s.ChannelMessageSend(m.ChannelID, response)
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to send message")
+				err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+				if err != nil {
+					zlog.Error().Err(err).Msg("Failed to add reaction")
+				}
+				return
+			}
 		}
 
 		err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "✅")
