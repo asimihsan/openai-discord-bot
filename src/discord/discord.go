@@ -28,6 +28,7 @@ import (
 	"src/openai"
 	"strings"
 	"sync"
+	"time"
 )
 
 type GuildID string
@@ -318,7 +319,7 @@ func NewDiscord(
 			return true
 		}(); shouldCreateThread {
 			// Use OpenAI to summarize the message into a short title with less than 4 words.
-			summary, err := discord.openaiClient.Summarize(m.Message.Content, 4, context.TODO(), &zlog)
+			summary, err := discord.openaiClient.Summarize(m.Message.Content, 8, context.TODO(), &zlog)
 			if err != nil {
 				zlog.Error().Err(err).Msg("Failed to summarize message")
 				return
@@ -447,7 +448,24 @@ func NewDiscord(
 				Text:      message.Content,
 			})
 		}
-		response, err := openaiClient.CompleteChat(chatMessages, context.TODO(), &zlog)
+
+		zlog.Info().Int("messages", len(chatMessages)).Msg("Completing chat")
+
+		// Post a placeholder message to the thread.
+		msg, err := s.ChannelMessageSend(m.ChannelID, "Thinking...")
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to send placeholder message")
+			return
+		}
+
+		outputChannel := make(chan string)
+		errChannel := make(chan error)
+		cancelChannel := make(chan bool)
+
+		var fullResponse string
+
+		err = openaiClient.ChatCompleteStream(
+			chatMessages, outputChannel, errChannel, cancelChannel, context.TODO(), &zlog)
 		if err != nil {
 			zlog.Error().Err(err).Msg("Failed to complete chat")
 			err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
@@ -456,49 +474,73 @@ func NewDiscord(
 			}
 			return
 		}
+		for {
+			select {
+			case responseChunk, ok := <-outputChannel:
+				if !ok {
+					zlog.Info().Msg("OpenAI API stream closed")
 
-		// split the message on full stops ("."). Send the message in 2000 character chunks, so join the chunks
-		// until the length of the message is less than 2000 characters.
-		responseChunks := make([]string, 0)
-		currentSize := 0
-		for _, chunk := range strings.Split(response, ".") {
-			if len(chunk) == 0 {
-				continue
-			}
-			if currentSize+len(chunk) > 2000 {
-				response := strings.Join(responseChunks, ".")
-				_, err = s.ChannelMessageSend(m.ChannelID, response)
+					// if there is a message in errChannel, it means the stream closed due to an error. Else
+					// it means the stream closed because the context was cancelled.
+					select {
+					case err := <-errChannel:
+						zlog.Error().Err(err).Msg("OpenAI API stream closed due to error")
+						err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+						if err != nil {
+							zlog.Error().Err(err).Msg("Failed to add reaction")
+						}
+					default:
+						zlog.Info().Msg("OpenAI API stream closed due to context cancellation")
+						err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "✅")
+						if err != nil {
+							zlog.Error().Err(err).Msg("Failed to add reaction")
+						}
+					}
+					return
+				}
+				zlog.Info().Str("responseChunk", responseChunk).Msg("OpenAI API responseChunk")
+
+				// If responseChunk pushes fullResponse over 2000 characters, mark the current message as done
+				// using an emoji, and post a new message, and continue appending to the new message.
+				if len(fullResponse)+len(responseChunk) > 2000 {
+					err = s.MessageReactionAdd(m.ChannelID, msg.ID, "✅")
+					if err != nil {
+						zlog.Error().Err(err).Msg("Failed to add reaction")
+					}
+					msg, err = s.ChannelMessageSend(m.ChannelID, responseChunk)
+					if err != nil {
+						zlog.Error().Err(err).Msg("Failed to send message")
+						err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
+						if err != nil {
+							zlog.Error().Err(err).Msg("Failed to add reaction")
+						}
+						return
+					}
+					fullResponse = responseChunk
+					continue
+				}
+
+				fullResponse += responseChunk
+				_, err = s.ChannelMessageEdit(m.ChannelID, msg.ID, fullResponse)
 				if err != nil {
-					zlog.Error().Err(err).Msg("Failed to send message")
+					zlog.Error().Err(err).Msg("Failed to edit message")
 					err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
 					if err != nil {
 						zlog.Error().Err(err).Msg("Failed to add reaction")
 					}
 					return
 				}
-				responseChunks = []string{chunk}
-				currentSize = len(chunk)
-				continue
-			}
-			responseChunks = append(responseChunks, chunk)
-			currentSize += len(chunk)
-		}
-		response = strings.Join(responseChunks, ".")
-		if len(response) > 0 {
-			_, err = s.ChannelMessageSend(m.ChannelID, response)
-			if err != nil {
-				zlog.Error().Err(err).Msg("Failed to send message")
+
+			case <-time.After(30 * time.Second):
+				zlog.Info().Msg("Timed out waiting for a delta from the OpenAI API stream")
+				cancelChannel <- true
+				close(outputChannel)
 				err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "❌")
 				if err != nil {
 					zlog.Error().Err(err).Msg("Failed to add reaction")
 				}
 				return
 			}
-		}
-
-		err = s.MessageReactionAdd(m.ChannelID, lastMessage.ID, "✅")
-		if err != nil {
-			zlog.Error().Err(err).Msg("Failed to add reaction")
 		}
 	})
 

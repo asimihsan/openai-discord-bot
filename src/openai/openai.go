@@ -25,6 +25,7 @@ import (
 	"github.com/rs/zerolog"
 	goopenai "github.com/sashabaranov/go-openai"
 	"go.uber.org/ratelimit"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -66,9 +67,7 @@ func GetCurrentDate() string {
 	return tm.Format("2006-01-02")
 }
 
-func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog *zerolog.Logger) (string, error) {
-	o.limiter.Take()
-	var resultErr error
+func ConvertChatMessagesToChatCompletionMessages(messages []*ChatMessage) []goopenai.ChatCompletionMessage {
 	requestMessages := make([]goopenai.ChatCompletionMessage, 0, len(messages))
 
 	for i := 0; i < len(messages); i++ {
@@ -86,6 +85,14 @@ func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog
 		}
 	}
 
+	return requestMessages
+}
+
+func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog *zerolog.Logger) (string, error) {
+	o.limiter.Take()
+	var resultErr error
+	requestMessages := ConvertChatMessagesToChatCompletionMessages(messages)
+
 	completion, err := o.ChatComplete(requestMessages, ctx, zlog)
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to complete prompt")
@@ -95,6 +102,62 @@ func (o *OpenAI) CompleteChat(messages []*ChatMessage, ctx context.Context, zlog
 	zlog.Debug().Interface("requestMessages", requestMessages).Msgf("completion: %s", completion)
 
 	return completion, nil
+}
+
+func (o *OpenAI) ChatCompleteStream(
+	messages []*ChatMessage,
+	outputChannel chan string,
+	errChannel chan error,
+	cancelChannel chan bool,
+	ctx context.Context,
+	zlog *zerolog.Logger,
+) error {
+	requestMessages := ConvertChatMessagesToChatCompletionMessages(messages)
+
+	o.limiter.Take()
+	var resultErr error
+	stream, err := o.client.CreateChatCompletionStream(ctx, goopenai.ChatCompletionRequest{
+		Model:       goopenai.GPT4,
+		Messages:    requestMessages,
+		MaxTokens:   4096,
+		Temperature: 0.0,
+		TopP:        1.0,
+		Stream:      false,
+		Stop:        []string{"<|endoftext|>"},
+	})
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to complete chat")
+		resultErr = multierror.Append(resultErr, err, FailedToCompletePrompt)
+		return resultErr
+	}
+	defer stream.Close()
+
+	for {
+		select {
+		case <-cancelChannel:
+			zlog.Debug().Msg("Canceling chat completion stream")
+			close(outputChannel)
+			return nil
+		default:
+			completion, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				zlog.Debug().Msg("Chat completion stream EOF")
+				close(outputChannel)
+				close(errChannel)
+				return nil
+			}
+			if err != nil {
+				zlog.Error().Err(err).Msg("Failed to complete chat")
+				resultErr = multierror.Append(resultErr, err, FailedToCompletePrompt)
+				errChannel <- err
+				close(outputChannel)
+				return resultErr
+			}
+			content := completion.Choices[0].Delta.Content
+			zlog.Debug().Msgf("completion delta: %s", content)
+			outputChannel <- content
+		}
+	}
 }
 
 func (o *OpenAI) ChatComplete(
@@ -198,7 +261,7 @@ func (o *OpenAI) Summarize(
 	prompt := promptBuilder.String()
 
 	completion, err := o.client.CreateCompletion(ctx, goopenai.CompletionRequest{
-		Model:     goopenai.GPT3TextDavinci003,
+		Model:     goopenai.GPT4,
 		MaxTokens: 64,
 		Prompt:    prompt,
 		Stop:      []string{"<|endoftext|>"},

@@ -363,7 +363,7 @@ func (d *DynamoDBLockClient) getLock(
 		int64(createdAtMilliseconds),
 		data,
 	))
-	zlog.Debug().Interface("lock", newLock).Msg("returning new lock")
+	zlog.Debug().Interface("lock", newLock).Msg("returning lock")
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
