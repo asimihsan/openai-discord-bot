@@ -28,6 +28,7 @@ import (
 	"src/openai"
 	"strings"
 	"sync"
+	"time"
 )
 
 type GuildID string
@@ -57,8 +58,10 @@ func NewIDsMap(guildIDs []GuildID) IDsMap {
 }
 
 type Config struct {
-	RemoveCommands bool
-	ChannelPrefix  string
+	RemoveCommands    bool
+	ChannelPrefix     string
+	WatchdogThreshold time.Duration
+	WatchdogInterval  time.Duration
 }
 
 type Discord struct {
@@ -243,6 +246,7 @@ func NewDiscord(
 	zlog *zerolog.Logger,
 ) (*Discord, error) {
 	discordClient, err := discordgo.New("Bot " + discordToken)
+
 	if err != nil {
 		zlog.Error().Err(err).Msg("failed to create Discord client")
 		return nil, err
@@ -253,8 +257,10 @@ func NewDiscord(
 		openaiClient:  openaiClient,
 		lockClient:    lockClient,
 		config: Config{
-			RemoveCommands: false,
-			ChannelPrefix:  "openai",
+			RemoveCommands:    false,
+			ChannelPrefix:     "openai",
+			WatchdogThreshold: 30 * time.Second,
+			WatchdogInterval:  30 * time.Second,
 		},
 		idsMap: NewIDsMap([]GuildID{GuildID(guildID)}),
 		zlog:   zlog,
@@ -266,6 +272,12 @@ func NewDiscord(
 	err = discordClient.Open()
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed to open Discord client")
+		return nil, err
+	}
+
+	err = discord.startWatchdog()
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to start watchdog")
 		return nil, err
 	}
 
@@ -317,8 +329,8 @@ func NewDiscord(
 
 			return true
 		}(); shouldCreateThread {
-			// Use OpenAI to summarize the message into a short title with less than 4 words.
-			summary, err := discord.openaiClient.Summarize(m.Message.Content, 4, context.TODO(), &zlog)
+			// Use OpenAI to summarize the message into a short title with less than 10 words.
+			summary, err := discord.openaiClient.Summarize(m.Message.Content, 10, context.TODO(), &zlog)
 			if err != nil {
 				zlog.Error().Err(err).Msg("Failed to summarize message")
 				return
@@ -664,6 +676,22 @@ func (d *Discord) Close(zlog *zerolog.Logger) error {
 	}
 
 	return resultError
+}
+
+// startWatchdog starts a goroutine that periodically checks HeartbeatLatency() and if it exceeds the configured
+// threshold, panics() to halt the process. This is to ensure that the process is restarted by the container manager.
+func (d *Discord) startWatchdog() error {
+	go func() {
+		for {
+			d.zlog.Debug().Dur("latency", d.discordClient.HeartbeatLatency()).Msg("Heartbeat latency")
+			latency := d.discordClient.HeartbeatLatency()
+			if latency > d.config.WatchdogThreshold {
+				d.zlog.Fatal().Dur("latency", latency).Msg("Heartbeat latency exceeded threshold, exiting")
+			}
+			time.Sleep(d.config.WatchdogInterval)
+		}
+	}()
+	return nil
 }
 
 func getPayloadFromIteraction(i *discordgo.InteractionCreate) string {

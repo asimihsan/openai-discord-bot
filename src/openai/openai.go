@@ -199,7 +199,7 @@ func (o *OpenAI) Summarize(
 
 	completion, err := o.client.CreateCompletion(ctx, goopenai.CompletionRequest{
 		Model:     goopenai.GPT3TextDavinci003,
-		MaxTokens: 64,
+		MaxTokens: 16,
 		Prompt:    prompt,
 		Stop:      []string{"<|endoftext|>"},
 	})
@@ -213,6 +213,23 @@ func (o *OpenAI) Summarize(
 
 	// trim punctuation from summary
 	summary = strings.TrimRight(summary, ".")
+
+	// Discord only allows up to 100 characters. Split the string on spaces, and then join chunks in a string builder
+	// until you hit < 100 characters.
+	if len(summary) > 100 {
+		var sb strings.Builder
+		words := strings.Split(summary, " ")
+		for i, word := range words {
+			if sb.Len()+len(word)+1 >= 100 {
+				break
+			}
+			sb.WriteString(word)
+			if i != len(words)-1 {
+				sb.WriteString(" ")
+			}
+		}
+		summary = sb.String()
+	}
 
 	return summary, err
 }
